@@ -41,7 +41,7 @@ DEFAULT_MAX_BACKUP_SIZE = 20 * 1024 * 1024 * 1024  # 20 GiB，按清理批次保
 
 
 # 这些类别只能用于分析展示，任何调用方都不能把它们交给删除核心。
-ANALYSIS_ONLY_CATEGORIES = frozenset({'large_files'})
+ANALYSIS_ONLY_CATEGORIES = frozenset({'large_files', 'ai_models', 'docker_data'})
 
 # 这些系统维护场景不适合通过递归删除实现，应使用 Windows 官方维护接口。
 DISABLED_CLEANUP_CATEGORIES = frozenset({
@@ -775,6 +775,25 @@ class CleanerLogic:
             'installer_cache': [], # 安装程序缓存(安全版)
             'delivery_opt': [],  # Windows传递优化缓存
 
+            # IDE / 开发工具
+            'ide_cache': [],     # IDE缓存
+            'dev_pkg_cache': [], # 开发包管理器缓存
+
+            # AI / 大模型
+            'ai_cache': [],      # AI应用缓存
+            'ai_models': [],     # AI模型文件(仅分析)
+
+            # 通讯社交
+            'messaging_cache': [], # 通讯应用缓存
+
+            # 浏览器补充 + 游戏娱乐
+            'browser_extra': [], # 其它浏览器缓存
+            'gaming_cache': [],  # 游戏娱乐缓存
+
+            # 工具 / 办公
+            'tool_cache': [],    # 办公工具缓存
+            'docker_data': [],   # Docker数据(仅分析)
+
             # 大文件扫描
             'large_files': []    # 大文件
         }
@@ -810,9 +829,18 @@ class CleanerLogic:
             self._scan_windows_defender,
             self._scan_store_cache,
             self._scan_onedrive_cache,
-            self._scan_downloads_immediate,
+            self._scan_downloads,
             self._scan_installer_cache_safe,
             self._scan_delivery_optimization,
+            self._scan_ide_cache,
+            self._scan_dev_package_cache,
+            self._scan_ai_app_cache,
+            self._scan_ai_models,
+            self._scan_messaging_cache,
+            self._scan_browser_extra,
+            self._scan_gaming_cache,
+            self._scan_tool_cache,
+            self._scan_docker_data,
             self._scan_large_files
         ]
 
@@ -847,9 +875,18 @@ class CleanerLogic:
             self._scan_windows_defender: "Windows Defender缓存",
             self._scan_store_cache: "Windows Store缓存",
             self._scan_onedrive_cache: "OneDrive缓存",
-            self._scan_downloads_immediate: "下载文件夹",
+            self._scan_downloads: "下载文件夹",
             self._scan_installer_cache_safe: "安装程序缓存",
             self._scan_delivery_optimization: "Windows传递优化缓存",
+            self._scan_ide_cache: "IDE开发工具缓存",
+            self._scan_dev_package_cache: "开发包管理器缓存",
+            self._scan_ai_app_cache: "AI应用缓存",
+            self._scan_ai_models: "AI模型文件",
+            self._scan_messaging_cache: "通讯应用缓存",
+            self._scan_browser_extra: "其它浏览器缓存",
+            self._scan_gaming_cache: "游戏娱乐缓存",
+            self._scan_tool_cache: "办公工具缓存",
+            self._scan_docker_data: "Docker数据",
             self._scan_large_files: "大文件",
         }
 
@@ -883,9 +920,18 @@ class CleanerLogic:
             self._scan_windows_defender: 'windows_defender',
             self._scan_store_cache: 'store_cache',
             self._scan_onedrive_cache: 'onedrive_cache',
-            self._scan_downloads_immediate: 'downloads',
+            self._scan_downloads: 'downloads',
             self._scan_installer_cache_safe: 'installer_cache',
             self._scan_delivery_optimization: 'delivery_opt',
+            self._scan_ide_cache: 'ide_cache',
+            self._scan_dev_package_cache: 'dev_pkg_cache',
+            self._scan_ai_app_cache: 'ai_cache',
+            self._scan_ai_models: 'ai_models',
+            self._scan_messaging_cache: 'messaging_cache',
+            self._scan_browser_extra: 'browser_extra',
+            self._scan_gaming_cache: 'gaming_cache',
+            self._scan_tool_cache: 'tool_cache',
+            self._scan_docker_data: 'docker_data',
             self._scan_large_files: 'large_files',
         }
         skip = set(skip_categories or [])
@@ -1068,7 +1114,35 @@ class CleanerLogic:
                             logger.warning(f"无法访问文件 {file_path}: {e}")
 
     def _scan_recycle_bin(self, results):
-        """扫描回收站"""
+        """扫描回收站 - 使用 Shell API 获取回收站信息。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class SHQUERYRBINFO(ctypes.Structure):
+                _fields_ = [
+                    ('cbSize', wintypes.DWORD),
+                    ('i64Size', ctypes.c_longlong),
+                    ('i64NumItems', ctypes.c_longlong),
+                ]
+
+            info = SHQUERYRBINFO()
+            info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
+            # None = 查询所有驱动器的回收站
+            result = ctypes.windll.shell32.SHQueryRecycleBinW(None, ctypes.byref(info))
+            if result == 0 and info.i64Size > 0:
+                results['recycle'].append({
+                    'path': 'C:\\$Recycle.Bin',
+                    'size': info.i64Size,
+                    'type': 'recycle'
+                })
+        except Exception as e:
+            logger.warning(f"无法查询回收站: {e}")
+            # 回退到文件遍历方式
+            self._scan_recycle_bin_fallback(results)
+
+    def _scan_recycle_bin_fallback(self, results):
+        """回退：通过遍历文件系统扫描回收站。"""
         recycle_bin = os.path.join('C:', os.sep, '$Recycle.Bin')
         if os.path.exists(recycle_bin):
             total_size = 0
@@ -1691,7 +1765,255 @@ class CleanerLogic:
             os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'OneDrive', 'settings', 'Personal', 'logs'),
         ])
 
-    def _scan_downloads_immediate(self, results):
+    # ==================== IDE / 开发工具缓存 ====================
+
+    def _scan_ide_cache(self, results):
+        """扫描 IDE 和开发工具缓存（JetBrains、VS Code、Eclipse、Visual Studio）"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        appdata = os.environ.get('APPDATA', '')
+        home = os.path.expanduser('~')
+
+        dirs = []
+        # JetBrains 全家桶 (IntelliJ IDEA, PyCharm, WebStorm, GoLand, CLion, etc.)
+        jetbrains_base = os.path.join(local, 'JetBrains')
+        if os.path.isdir(jetbrains_base):
+            for product_dir in os.listdir(jetbrains_base):
+                product_path = os.path.join(jetbrains_base, product_dir)
+                if os.path.isdir(product_path):
+                    for sub in ('caches', 'log', 'index', 'tmp'):
+                        candidate = os.path.join(product_path, sub)
+                        if os.path.isdir(candidate):
+                            dirs.append(candidate)
+
+        # VS Code
+        for sub in ('Cache', 'CachedData', 'CachedExtensions', 'CachedExtensionVSIXs', 'logs'):
+            dirs.append(os.path.join(appdata, 'Code', sub))
+        # VS Code - Insiders
+        for sub in ('Cache', 'CachedData', 'logs'):
+            dirs.append(os.path.join(appdata, 'Code - Insiders', sub))
+
+        # Eclipse
+        dirs.append(os.path.join(home, '.eclipse'))
+
+        # Visual Studio
+        vs_base = os.path.join(local, 'Microsoft', 'VisualStudio')
+        if os.path.isdir(vs_base):
+            for ver_dir in os.listdir(vs_base):
+                candidate = os.path.join(vs_base, ver_dir, 'ComponentModelCache')
+                if os.path.isdir(candidate):
+                    dirs.append(candidate)
+
+        # Android Studio
+        android_studio_base = os.path.join(local, 'Google')
+        if os.path.isdir(android_studio_base):
+            for d in os.listdir(android_studio_base):
+                if d.startswith('AndroidStudio'):
+                    for sub in ('caches', 'log'):
+                        candidate = os.path.join(android_studio_base, d, sub)
+                        if os.path.isdir(candidate):
+                            dirs.append(candidate)
+
+        self._scan_directories(results, 'ide_cache', dirs)
+
+    def _scan_dev_package_cache(self, results):
+        """扫描开发包管理器缓存（Gradle、npm、yarn、pnpm、pip、conda）"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        appdata = os.environ.get('APPDATA', '')
+        home = os.path.expanduser('~')
+
+        dirs = [
+            # Gradle
+            os.path.join(home, '.gradle', 'caches'),
+            # npm
+            os.path.join(local, 'npm-cache'),
+            os.path.join(appdata, 'npm-cache'),
+            # yarn
+            os.path.join(local, 'Yarn', 'Cache'),
+            # pnpm
+            os.path.join(local, 'pnpm-cache'),
+            os.path.join(local, 'pnpm', 'store'),
+            # pip
+            os.path.join(local, 'pip', 'cache'),
+            # conda
+            os.path.join(home, '.conda', 'pkgs'),
+            # Go modules
+            os.path.join(home, 'go', 'pkg', 'mod', 'cache'),
+            # Cargo (Rust)
+            os.path.join(home, '.cargo', 'registry', 'cache'),
+            # NuGet
+            os.path.join(local, 'NuGet', 'v3-cache'),
+            # Composer (PHP)
+            os.path.join(local, 'Composer', 'cache'),
+        ]
+        self._scan_directories(results, 'dev_pkg_cache', dirs)
+
+    # ==================== AI / 大模型应用 ====================
+
+    def _scan_ai_app_cache(self, results):
+        """扫描 AI/大模型应用缓存（ChatGPT、Claude、Cursor、GitHub Desktop）"""
+        appdata = os.environ.get('APPDATA', '')
+        local = os.environ.get('LOCALAPPDATA', '')
+
+        dirs = [
+            # ChatGPT Desktop
+            os.path.join(appdata, 'ChatGPT', 'Cache'),
+            os.path.join(appdata, 'ChatGPT', 'Code Cache'),
+            os.path.join(appdata, 'ChatGPT', 'GPUCache'),
+            # Claude Desktop
+            os.path.join(appdata, 'Claude', 'Cache'),
+            os.path.join(appdata, 'Claude', 'Code Cache'),
+            os.path.join(appdata, 'Claude', 'GPUCache'),
+            # Cursor (VS Code fork)
+            os.path.join(appdata, 'Cursor', 'Cache'),
+            os.path.join(appdata, 'Cursor', 'CachedData'),
+            os.path.join(appdata, 'Cursor', 'CachedExtensionVSIXs'),
+            os.path.join(appdata, 'Cursor', 'logs'),
+            # GitHub Desktop
+            os.path.join(appdata, 'GitHub Desktop', 'Cache'),
+            os.path.join(local, 'GitHubDesktop', 'Cache'),
+        ]
+        self._scan_directories(results, 'ai_cache', dirs)
+
+    def _scan_ai_models(self, results):
+        """扫描 AI 模型文件（Ollama、HuggingFace）— 仅分析展示"""
+        home = os.path.expanduser('~')
+        dirs = [
+            os.path.join(home, '.ollama', 'models'),
+            os.path.join(home, '.cache', 'huggingface'),
+        ]
+        self._scan_directories(results, 'ai_models', dirs)
+
+    # ==================== 通讯 / 社交 ====================
+
+    def _scan_messaging_cache(self, results):
+        """扫描通讯社交应用缓存（微信、QQ、钉钉、飞书、Telegram、Zoom）"""
+        appdata = os.environ.get('APPDATA', '')
+        local = os.environ.get('LOCALAPPDATA', '')
+        home = os.path.expanduser('~')
+
+        dirs = [
+            # Telegram
+            os.path.join(appdata, 'Telegram Desktop', 'tdata', 'user_data', 'cache'),
+            # Zoom
+            os.path.join(appdata, 'Zoom', 'data'),
+            os.path.join(appdata, 'Zoom', 'data', 'Cache'),
+        ]
+
+        # 微信 - FileStorage/Cache under Documents/WeChat Files
+        wechat_base = os.path.join(home, 'Documents', 'WeChat Files')
+        if os.path.isdir(wechat_base):
+            for user_dir in os.listdir(wechat_base):
+                cache_path = os.path.join(wechat_base, user_dir, 'FileStorage', 'Cache')
+                if os.path.isdir(cache_path):
+                    dirs.append(cache_path)
+
+        # QQ
+        qq_base = os.path.join(home, 'Documents', 'Tencent Files')
+        if os.path.isdir(qq_base):
+            for user_dir in os.listdir(qq_base):
+                cache_path = os.path.join(qq_base, user_dir, 'FileRecv', '.cache')
+                if os.path.isdir(cache_path):
+                    dirs.append(cache_path)
+
+        # 钉钉
+        dingtalk_base = os.path.join(appdata, 'DingTalk')
+        if os.path.isdir(dingtalk_base):
+            for sub in os.listdir(dingtalk_base):
+                cache_path = os.path.join(dingtalk_base, sub, 'Cache')
+                if os.path.isdir(cache_path):
+                    dirs.append(cache_path)
+
+        # 飞书
+        lark_base = os.path.join(appdata, 'Lark')
+        if os.path.isdir(lark_base):
+            for sub in os.listdir(lark_base):
+                cache_path = os.path.join(lark_base, sub, 'Cache')
+                if os.path.isdir(cache_path):
+                    dirs.append(cache_path)
+
+        self._scan_directories(results, 'messaging_cache', dirs)
+
+    # ==================== 浏览器补充 + 游戏娱乐 ====================
+
+    def _scan_browser_extra(self, results):
+        """扫描补充浏览器缓存（Firefox、Opera、Brave、Arc）"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        appdata = os.environ.get('APPDATA', '')
+
+        dirs = [
+            # Opera
+            os.path.join(appdata, 'Opera Software', 'Opera Stable', 'Cache'),
+            os.path.join(appdata, 'Opera Software', 'Opera GX Stable', 'Cache'),
+            # Brave
+            os.path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data', 'Default', 'Cache'),
+            os.path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data', 'Default', 'Code Cache'),
+        ]
+
+        # Firefox - 多 profile
+        firefox_profiles = os.path.join(local, 'Mozilla', 'Firefox', 'Profiles')
+        if os.path.isdir(firefox_profiles):
+            for profile in os.listdir(firefox_profiles):
+                cache_path = os.path.join(firefox_profiles, profile, 'cache2')
+                if os.path.isdir(cache_path):
+                    dirs.append(cache_path)
+
+        self._scan_directories(results, 'browser_extra', dirs)
+
+    def _scan_gaming_cache(self, results):
+        """扫描游戏/娱乐应用缓存（Steam、Epic、网易云音乐、QQ音乐、哔哩哔哩）"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        appdata = os.environ.get('APPDATA', '')
+
+        dirs = [
+            # Steam
+            os.path.join(local, 'Steam', 'htmlcache'),
+            # Epic Games
+            os.path.join(local, 'EpicGamesLauncher', 'Saved', 'webcache'),
+            os.path.join(local, 'EpicGamesLauncher', 'Saved', 'Logs'),
+            # 网易云音乐
+            os.path.join(local, 'Netease', 'CloudMusic', 'Cache'),
+            # QQ音乐
+            os.path.join(local, 'Tencent', 'QQMusic', 'Cache'),
+            os.path.join(appdata, 'Tencent', 'QQMusic', 'Cache'),
+            # 哔哩哔哩
+            os.path.join(appdata, 'bilibili', 'Cache'),
+            os.path.join(local, 'bilibili', 'Cache'),
+        ]
+        self._scan_directories(results, 'gaming_cache', dirs)
+
+    # ==================== 工具 / 办公 + 运行时 ====================
+
+    def _scan_tool_cache(self, results):
+        """扫描工具/办公应用缓存（WPS、Notion、Obsidian、Figma、Postman）"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        appdata = os.environ.get('APPDATA', '')
+
+        dirs = [
+            # WPS
+            os.path.join(local, 'Kingsoft', 'WPS Cloud Files', 'cache'),
+            # Notion
+            os.path.join(appdata, 'Notion', 'Cache'),
+            os.path.join(appdata, 'Notion', 'Code Cache'),
+            # Obsidian
+            os.path.join(appdata, 'obsidian', 'Cache'),
+            os.path.join(appdata, 'obsidian', 'Code Cache'),
+            # Figma
+            os.path.join(appdata, 'Figma', 'Cache'),
+            os.path.join(appdata, 'Figma', 'Code Cache'),
+            # Postman
+            os.path.join(appdata, 'Postman', 'Cache'),
+            os.path.join(appdata, 'Postman', 'Code Cache'),
+        ]
+        self._scan_directories(results, 'tool_cache', dirs)
+
+    def _scan_docker_data(self, results):
+        """扫描 Docker Desktop 数据 — 仅分析展示"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        dirs = [
+            os.path.join(local, 'Docker', 'wsl', 'data'),
+        ]
+        self._scan_directories(results, 'docker_data', dirs)
+
         """扫描下载文件夹 - 列出所有文件供用户逐个选择"""
         # 获取当前用户的下载文件夹
         download_dirs = [

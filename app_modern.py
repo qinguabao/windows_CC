@@ -55,6 +55,11 @@ CATEGORIES = {
     'windows_defender': "Windows Defender缓存", 'store_cache': "Windows Store缓存",
     'onedrive_cache': "OneDrive缓存", 'downloads': "下载文件夹 ⚠高风险",
     'installer_cache': "安装程序缓存", 'delivery_opt': "Windows传递优化缓存",
+    'ide_cache': "IDE开发工具缓存", 'dev_pkg_cache': "开发包管理器缓存",
+    'ai_cache': "AI应用缓存", 'ai_models': "AI模型文件 (仅供查看)",
+    'messaging_cache': "通讯应用缓存", 'browser_extra': "其它浏览器缓存",
+    'gaming_cache': "游戏娱乐缓存", 'tool_cache': "办公工具缓存",
+    'docker_data': "Docker数据 (仅供查看)",
     'large_files': "大文件 (>100MB，仅供查看)",
 }
 
@@ -173,21 +178,23 @@ class CleanThread(QThread):
 
 
 class UpdateCheckThread(QThread):
-    """后台检查更新线程。"""
+    """后台检查更新线程（网络请求由 updater.check_update 完成）。"""
     update_available = Signal(dict)  # emit update info dict
-    no_update = Signal()
+    no_update = Signal(str)  # emit reason
     check_failed = Signal(str)
 
     def run(self):
+        import traceback
         try:
-            from updater import check_update
-            info = check_update()
+            from updater import check_update, UpdateError
+            info = check_update()  # 网络失败抛 UpdateError，无更新返回 None
             if info:
                 self.update_available.emit(info)
             else:
-                self.no_update.emit()
+                from version import APP_VERSION
+                self.no_update.emit(f'local={APP_VERSION} (remote not newer)')
         except Exception as e:
-            self.check_failed.emit(str(e))
+            self.check_failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 class ModernCleanerWindow(QMainWindow):
@@ -216,6 +223,12 @@ class ModernCleanerWindow(QMainWindow):
 
         self._refresh_disk()
         self._set_big(0)
+
+        # 上次自动更新的遗留清理；删除了 .old 说明这是一次成功更新后的首次启动
+        from updater import cleanup_after_update
+        if cleanup_after_update():
+            from version import APP_VERSION
+            self.statusBar().showMessage(f"已成功更新到 v{APP_VERSION}", 10000)
 
         # 启动后延迟 3 秒自动检查更新
         if self._user_settings.get('check_updates', True):
@@ -805,6 +818,7 @@ class ModernCleanerWindow(QMainWindow):
         """启动时自动检查更新（静默，无网络不提示）。"""
         self._update_thread = UpdateCheckThread()
         self._update_thread.update_available.connect(self._on_update_available)
+        self._update_thread.check_failed.connect(lambda e: None)  # 静默失败
         self._update_thread.start()
 
     def _manual_check_update(self):
@@ -817,7 +831,7 @@ class ModernCleanerWindow(QMainWindow):
         self._update_thread.check_failed.connect(self._on_update_check_failed)
         self._update_thread.start()
 
-    def _on_no_update(self):
+    def _on_no_update(self, reason):
         self.update_btn.setEnabled(True)
         self.update_btn.setText("检查更新")
         from version import APP_VERSION
@@ -828,7 +842,7 @@ class ModernCleanerWindow(QMainWindow):
         self.update_btn.setEnabled(True)
         self.update_btn.setText("检查更新")
         QMessageBox.warning(self, "检查更新失败",
-                            f"无法连接更新服务器：\n{error}")
+                            f"无法连接更新服务器：\n{error[:300]}")
 
     def _on_update_available(self, info):
         self.update_btn.setEnabled(True)
@@ -857,61 +871,69 @@ class ModernCleanerWindow(QMainWindow):
 
     def _start_download(self, info):
         """下载更新并显示进度。"""
-        from updater import download_update, apply_update
+        from updater import download_update
 
         url = info['download_url']
-        progress = QProgressDialog("正在下载更新…", "取消", 0, 100, self)
-        progress.setWindowTitle(f"更新到 v{info['version']}")
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        self._download_cancelled = False
-
-        def on_cancel():
-            self._download_cancelled = True
-
-        progress.canceled.connect(on_cancel)
+        expected_sha256 = info.get('sha256')
 
         class DownloadThread(QThread):
             progress_update = Signal(int)
             done = Signal(str)
             error = Signal(str)
 
-            def __init__(self, url):
+            def __init__(self, url, expected_sha256=None):
                 super().__init__()
                 self.url = url
+                self.expected_sha256 = expected_sha256
 
             def run(self):
                 try:
                     def cb(downloaded, total):
                         if total > 0:
-                            pct = int(downloaded * 100 / total)
+                            pct = min(int(downloaded * 100 / total), 100)
                             self.progress_update.emit(pct)
-                    path = download_update(self.url, cb)
+                    path = download_update(self.url, cb, self.expected_sha256)
                     self.done.emit(path)
                 except Exception as e:
                     self.error.emit(str(e))
 
-        self._dl_thread = DownloadThread(url)
-        self._dl_thread.progress_update.connect(progress.setValue)
+        self._dl_thread = DownloadThread(url, expected_sha256)
+
+        def on_progress(pct):
+            self.statusBar().showMessage(f"正在下载更新… {pct}%")
 
         def on_done(path):
-            progress.close()
-            if self._download_cancelled:
-                return
-            reply = QMessageBox.information(
+            self.statusBar().showMessage("下载完成")
+            reply = QMessageBox.question(
                 self, "下载完成",
-                f"新版本 v{info['version']} 已下载完成。\n点击确定将关闭程序并完成更新。",
-                QMessageBox.Ok | QMessageBox.Cancel)
-            if reply == QMessageBox.Ok:
-                apply_update(path)
+                f"新版本 v{info['version']} 已下载完成。\n点击'是'将关闭程序并自动完成更新。",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self._update_path = path
+                QTimer.singleShot(200, self._do_apply_update)
 
         def on_error(err):
-            progress.close()
+            self.statusBar().showMessage("")
             QMessageBox.warning(self, "下载失败", f"更新下载失败：\n{err}")
 
+        self._dl_thread.progress_update.connect(on_progress)
         self._dl_thread.done.connect(on_done)
         self._dl_thread.error.connect(on_error)
         self._dl_thread.start()
+
+    def _do_apply_update(self):
+        """延迟执行更新替换，确保 Qt 事件循环已完成对话框关闭。"""
+        from updater import apply_update
+        self.statusBar().showMessage("正在应用更新…")
+        ok = apply_update(self._update_path)
+        if not ok:
+            # apply_update 失败时已自动回滚，当前版本仍可运行
+            self.statusBar().showMessage("")
+            QMessageBox.critical(
+                self, "更新失败",
+                "自动更新未能完成（程序已回滚到当前版本）。\n"
+                f"可前往 GitHub 发布页手动下载新版：\n"
+                f"https://github.com/qinguabao/windows_CC/releases")
 
 
 def main():

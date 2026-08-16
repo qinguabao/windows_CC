@@ -1,0 +1,24 @@
+❯ 如何本地编译版本？如何发布版本至服务器？
+
+● 本地编译（不推送）：
+
+  python build_pro.py
+
+  产物在 dist/C盘清理工具Pro.exe，带版本信息嵌入。
+
+  ---
+  发布到 GitHub Releases（编译 + 推送 + 发布一条龙）：
+
+  # 使用当前 version.py 中的版本号
+  python release.py
+
+  # 或指定新版本号（自动更新 version.py）
+  python release.py 1.2.0
+
+  release.py 自动完成：
+  1. 读取/更新版本号
+  2. 调用 build_pro.py 编译 EXE
+  3. git commit + tag + push
+  4. gh release create 上传 EXE 到 GitHub Releases
+
+  前置条件：已安装 gh CLI 并登录（gh auth login）。
