@@ -291,6 +291,41 @@ class ApplyUpdateTests(unittest.TestCase):
         with open(fake_exe + '.old', 'rb') as f:
             self.assertEqual(f.read(), b'old')
 
+    def test_frozen_launch_strips_pyi_env(self):
+        """onefile 子进程不能继承 _PYI_*/_MEIPASS2 引导变量。
+
+        新实例继承后会跳过自解压、复用旧进程的临时目录；旧进程退出时引导器
+        删除该目录，新版本启动途中 base_library.zip 消失直接崩溃（v1.5.0 实锤）。
+        """
+        fake_exe = os.path.join(self.tmp, 'app.exe')
+        fake_new = os.path.join(self.tmp, 'new.exe')
+        with open(fake_exe, 'wb') as f:
+            f.write(b'old')
+        with open(fake_new, 'wb') as f:
+            f.write(b'new')
+        captured = {}
+
+        def fake_popen(*args, **kwargs):
+            captured.update(args=args, kwargs=kwargs)
+
+        with patch.object(updater.sys, 'frozen', True, create=True), \
+                patch.object(updater.sys, 'executable', fake_exe), \
+                patch.dict(updater.os.environ, {
+                    '_PYI_APPLICATION_HOME_DIR': r'C:\Temp\_MEI123',
+                    '_PYI_ARCHIVE_FILE': fake_exe,
+                    '_PYI_PARENT_PROCESS_LEVEL': '1',
+                    '_MEIPASS2': r'C:\Temp\_MEI123',
+                }), \
+                patch('subprocess.Popen', side_effect=fake_popen), \
+                patch.object(updater.os, '_exit', side_effect=lambda code: None):
+            updater.apply_update(fake_new)
+
+        env = captured['kwargs'].get('env') or {}
+        for var in ('_PYI_APPLICATION_HOME_DIR', '_PYI_ARCHIVE_FILE',
+                    '_PYI_PARENT_PROCESS_LEVEL', '_MEIPASS2'):
+            self.assertNotIn(var, env, f'{var} 必须从子进程环境剔除')
+        self.assertNotEqual(env, {}, '其余环境变量应保留（子进程需继承提权等状态）')
+
     def test_frozen_popen_failure_rolls_back(self):
         fake_exe = os.path.join(self.tmp, 'app.exe')
         fake_new = os.path.join(self.tmp, 'new.exe')

@@ -270,11 +270,18 @@ def apply_update(new_exe_path: str) -> bool:
         return False
 
     # 启动新版本。当前进程已提权，子进程继承权限，不会再弹 UAC。
+    # 必须剔除 PyInstaller onefile 的引导环境变量（_PYI_* 与旧版 _MEIPASS2）：
+    # 新实例若继承这些变量会跳过自解压、直接复用本进程的临时目录 _MEIxxxx，
+    # 而本进程退出后引导器会删除该目录，导致新版本启动途中崩溃
+    # （FileNotFoundError: base_library.zip）。
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith('_PYI_') and k != '_MEIPASS2'}
     try:
         subprocess.Popen(
             [current_exe],
             close_fds=True,
             cwd=os.path.dirname(current_exe),
+            env=env,
         )
     except OSError as e:
         # 新 EXE 启动失败：此时 current 位置是新版本、.old 是旧版本。
