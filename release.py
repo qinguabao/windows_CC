@@ -12,6 +12,7 @@
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -107,14 +108,22 @@ def create_release(version):
     print(f'\n=== 发布 GitHub Release: {tag} ===')
     # 用 file#label 指定 ASCII 资产名：中文文件名上传后会被改写成 "C.Pro.exe"，
     # 带版本号的 ASCII 名也方便用户分辨下载的文件
-    asset_label = f'CCleaner-Pro-v{version}.exe'
+    # GitHub 会把中文资产名清洗成 "C.Pro.exe"，带版本号的 ASCII 名方便用户
+    # 分辨下载的文件；#label 语法实测未生效，改为复制一份 ASCII 文件名再上传
+    asset_name = f'CCleaner-Pro-v{version}.exe'
+    asset_path = os.path.join(HERE, 'dist', asset_name)
+    shutil.copyfile(EXE_PATH, asset_path)
+    # gh release create 不支持 --clobber（那是 upload 的参数）；
+    # 重复发布时先删除同名 Release 再重建，达到同样的覆盖效果
+    if subprocess.call(['gh', 'release', 'view', tag]) == 0:
+        print(f'已存在 {tag} 的 Release，先删除再重建')
+        subprocess.check_call(['gh', 'release', 'delete', tag, '--yes'])
     cmd = [
         'gh', 'release', 'create', tag,
-        f'{EXE_PATH}#{asset_label}',
+        asset_path,
         '--title', f'C盘清理工具 Pro v{version}',
-        '--notes', f'## C盘清理工具 Pro v{version}\n\n下载 `{asset_label}` 即可使用。',
+        '--notes', f'## C盘清理工具 Pro v{version}\n\n下载 `{asset_name}` 即可使用。',
         '--latest',
-        '--clobber',  # 同名资产/Release 重复发布时覆盖而非报错
     ]
     rc = subprocess.call(cmd)
     if rc != 0:

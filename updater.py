@@ -3,11 +3,13 @@
 """自动更新模块：检查 GitHub Releases、下载新版（含 SHA-256 校验）、原地替换重启。
 
 替换采用 Windows 通用的 rename-swap 方案（Squirrel/Electron 更新器同款思路）：
-正在运行的 EXE 可以被重命名但不能被删除，因此
-    1. 旧 EXE 改名为 <name>.exe.old
-    2. 新 EXE 移动到原位置
-    3. 启动新 EXE，当前进程退出
-    4. 新版本下次启动时删除 .old 遗留文件
+正在运行的 EXE 可以被重命名但不能被删除，且 Windows 的 rename 不能跨盘
+（WinError 17，下载目录 %TEMP% 与程序常在不同磁盘），因此
+    1. 新 EXE 复制到程序目录作中转（<name>.exe.new）
+    2. 旧 EXE 改名为 <name>.exe.old
+    3. 中转文件换名到原位置（同目录内，必定同卷）
+    4. 启动新 EXE，当前进程退出
+    5. 新版本下次启动时删除 .old 遗留文件
 整个过程在 Python 内完成，不再依赖 cmd/bat 脚本（历史版本曾因 bat 中的
 重定向语法问题静默失败，且无法向用户反馈错误）。
 """
@@ -187,26 +189,45 @@ def _force_delete(path: str, retries: int = 3, delay: float = 0.5):
 def _swap_files(new_exe_path: str, current_exe: str):
     """把新 EXE 换到当前 EXE 的位置（rename-swap）。
 
-    旧文件改名为 <current>.old；新文件移动到 current 位置。
+    新 EXE 先复制到程序目录中转（下载目录 %TEMP% 与程序可能不在同一磁盘，
+    Windows 的 rename/replace 跨盘会报 WinError 17），再在同目录内换名：
+    旧文件改名为 <current>.old；中转文件换到 current 位置。
     任一步失败都会尝试回滚，保证当前 EXE 仍可运行。
     """
     backup_path = current_exe + '.old'
+    staging_path = current_exe + '.new'
+
     if os.path.exists(backup_path):
         # 上次更新成功后进程退出、但新版本还没来得及清理的遗留
         try:
             _force_delete(backup_path)
         except OSError as e:
             raise UpdateError(f'无法清理旧备份文件 {backup_path}: {e}')
+    if os.path.exists(staging_path):
+        try:
+            _force_delete(staging_path)
+        except OSError as e:
+            raise UpdateError(f'无法清理中转文件 {staging_path}: {e}')
+
+    # 跨盘安全的复制；此时当前 EXE 尚未被动过，失败无需回滚
+    try:
+        shutil.copyfile(new_exe_path, staging_path)
+    except OSError as e:
+        raise UpdateError(f'无法复制新版程序到程序目录（磁盘已满或权限不足）: {e}')
 
     try:
         # Windows 允许重命名正在运行的 EXE（不允许直接删除）
         os.replace(current_exe, backup_path)
     except OSError as e:
+        try:
+            _force_delete(staging_path)
+        except OSError:
+            pass
         raise UpdateError(f'无法重命名当前程序（可能被杀毒软件锁定）: {e}')
 
     try:
-        # os.replace 支持跨盘移动并覆盖目标
-        os.replace(new_exe_path, current_exe)
+        # 同目录内换名，必定同卷，不会触发跨盘错误
+        os.replace(staging_path, current_exe)
     except OSError as e:
         # 回滚：把旧文件放回去，保持程序可用
         try:
@@ -214,6 +235,12 @@ def _swap_files(new_exe_path: str, current_exe: str):
         except OSError:
             logger.error(f'回滚失败！请手动将 {backup_path} 改回 {current_exe}')
         raise UpdateError(f'无法放置新版程序: {e}')
+
+    # 换名成功后清理下载目录中的副本（失败不影响更新结果）
+    try:
+        _force_delete(new_exe_path)
+    except OSError:
+        pass
 
 
 def apply_update(new_exe_path: str) -> bool:

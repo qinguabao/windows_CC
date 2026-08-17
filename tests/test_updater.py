@@ -176,9 +176,45 @@ class SwapFilesTests(unittest.TestCase):
         updater._swap_files(new_exe, current)
         with open(current, 'rb') as f:
             self.assertEqual(f.read(), b'new-version')
-        self.assertFalse(os.path.exists(new_exe), '新文件应被移动而非复制')
+        self.assertFalse(os.path.exists(new_exe), '下载副本应被清理而非残留')
         with open(current + '.old', 'rb') as f:
             self.assertEqual(f.read(), b'old-version')
+
+    def test_swap_cross_volume_stages_copy(self):
+        """回归：程序与 %TEMP% 不在同一磁盘时，os.replace 跨盘报 WinError 17。
+
+        v1.4.0 及之前直接把下载文件 replace 到程序位置，D 盘用户的
+        自动更新必然失败；必须先复制到程序目录中转，再同目录换名。
+        """
+        src_dir = tempfile.mkdtemp()  # 模拟 %TEMP%（另一块盘）
+        try:
+            current = self._make('app.exe', b'old-version')
+            new_exe = os.path.join(src_dir, 'new.exe')
+            with open(new_exe, 'wb') as f:
+                f.write(b'new-version')
+
+            real_replace = os.replace
+
+            def cross_volume_replace(src, dst):
+                if os.path.dirname(os.path.abspath(src)) != \
+                        os.path.dirname(os.path.abspath(dst)):
+                    raise OSError(17, '系统无法将文件移到不同的磁盘驱动器。')
+                return real_replace(src, dst)
+
+            with patch.object(updater.os, 'replace',
+                              side_effect=cross_volume_replace):
+                updater._swap_files(new_exe, current)
+        finally:
+            for name in os.listdir(src_dir):
+                os.remove(os.path.join(src_dir, name))
+            os.rmdir(src_dir)
+
+        with open(current, 'rb') as f:
+            self.assertEqual(f.read(), b'new-version')
+        with open(current + '.old', 'rb') as f:
+            self.assertEqual(f.read(), b'old-version')
+        self.assertFalse(os.path.exists(current + '.new'), '中转文件应被清理')
+        self.assertFalse(os.path.exists(new_exe), '下载副本应被清理')
 
     def test_swap_removes_stale_old_first(self):
         current = self._make('app.exe', b'old-version')
