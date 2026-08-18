@@ -1,0 +1,8 @@
+{
+    "//": "复制本文件为 deploy.json 并填写（deploy.json 已加入 .gitignore，不会提交）。要求 SSH 密钥免密登录：没有密钥先 ssh-keygen -t ed25519，再把 ~/.ssh/id_ed25519.pub 的内容追加到服务器的 ~/.ssh/authorized_keys。服务器上 nginx 需把 public_base_url 指向 remote_dir，且对 latest.json 禁用缓存。",
+    "host": "服务器IP或域名",
+    "port": 22,
+    "user": "root",
+    "remote_dir": "/var/www/update",
+    "public_base_url": "http://www.qinshihuang.top"
+}

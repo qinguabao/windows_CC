@@ -25,7 +25,7 @@ from settings import load_settings, save_settings
 from backup_manager import BackupManagerDialog
 from storage_cleaner import StorageCleanerDialog
 from elevate import is_admin, relaunch_as_admin
-from version import APP_VERSION
+from version import APP_VERSION, UPDATE_BASE_URL
 
 APP_TITLE = f"C盘清理工具 Pro v{APP_VERSION}"
 # 高风险类别：默认不勾选，用户明确选择后才进入“清理选中项”。
@@ -932,8 +932,7 @@ class ModernCleanerWindow(QMainWindow):
             QMessageBox.critical(
                 self, "更新失败",
                 "自动更新未能完成（程序已回滚到当前版本）。\n"
-                f"可前往 GitHub 发布页手动下载新版：\n"
-                f"https://github.com/qinguabao/windows_CC/releases")
+                f"可前往官网手动下载新版：\n{UPDATE_BASE_URL}")
 
 
 def main():

@@ -61,40 +61,69 @@ class VersionCompareTests(unittest.TestCase):
 
 
 class CheckUpdateTests(unittest.TestCase):
-    def _api_payload(self, tag='v1.9.9', assets=None):
-        return json.dumps({
-            'tag_name': tag,
-            'body': 'changelog',
-            'published_at': '2026-01-01T00:00:00Z',
-            'assets': assets if assets is not None else [{
-                'name': 'CCleaner-Pro-v1.9.9.exe',
-                'browser_download_url': 'https://example.com/dl.exe',
-                'digest': 'sha256:' + 'a' * 64,
-            }],
-        }).encode('utf-8')
+    """check_update 拉取服务器 latest.json 的解析与校验。"""
+
+    def _manifest(self, version='1.9.9', url=None, sha256=None,
+                  notes='更新说明', date='2026-08-17'):
+        manifest = {
+            'version': version,
+            'url': url or 'http://update.example.com/CCleaner-Pro-v1.9.9.exe',
+            # 注意用 is None 判断：空串本身就是要测的非法值
+            'sha256': 'a' * 64 if sha256 is None else sha256,
+            'notes': notes,
+            'date': date,
+        }
+        return json.dumps(manifest).encode('utf-8')
 
     @patch.object(updater, 'APP_VERSION', '1.2.0')
     @patch('urllib.request.urlopen')
-    def test_update_available_with_digest(self, mock_urlopen):
-        mock_urlopen.return_value = FakeResponse(self._api_payload())
+    def test_update_available_from_manifest(self, mock_urlopen):
+        mock_urlopen.return_value = FakeResponse(self._manifest())
         info = updater.check_update()
         self.assertIsNotNone(info)
         self.assertEqual(info['version'], '1.9.9')
+        self.assertEqual(info['tag'], 'v1.9.9')
         self.assertEqual(info['sha256'], 'a' * 64)
-        self.assertEqual(info['download_url'], 'https://example.com/dl.exe')
+        self.assertEqual(
+            info['download_url'],
+            'http://update.example.com/CCleaner-Pro-v1.9.9.exe')
+        self.assertEqual(info['changelog'], '更新说明')
+        self.assertEqual(info['published_at'], '2026-08-17')
 
     @patch.object(updater, 'APP_VERSION', '1.2.0')
     @patch('urllib.request.urlopen')
     def test_no_update_when_remote_not_newer(self, mock_urlopen):
-        mock_urlopen.return_value = FakeResponse(self._api_payload(tag='v1.2.0'))
+        mock_urlopen.return_value = FakeResponse(self._manifest(version='v1.2.0'))
         self.assertIsNone(updater.check_update())
 
     @patch.object(updater, 'APP_VERSION', '1.2.0')
     @patch('urllib.request.urlopen')
-    def test_no_exe_asset_returns_none(self, mock_urlopen):
+    def test_manifest_without_valid_sha256_ignored(self, mock_urlopen):
+        # HTTP 明文下载，SHA-256 是唯一完整性保障：缺失或格式不对一律拒绝
+        for bad in ('', 'z' * 64, 'a' * 63, 'sha256:' + 'a' * 64):
+            mock_urlopen.return_value = FakeResponse(self._manifest(sha256=bad))
+            self.assertIsNone(
+                updater.check_update(), f'sha256={bad!r} 时不应提供更新')
+
+    @patch.object(updater, 'APP_VERSION', '1.2.0')
+    @patch('urllib.request.urlopen')
+    def test_manifest_with_non_exe_url_ignored(self, mock_urlopen):
         mock_urlopen.return_value = FakeResponse(
-            self._api_payload(assets=[{'name': 'source.zip'}]))
+            self._manifest(url='http://update.example.com/update.zip'))
         self.assertIsNone(updater.check_update())
+
+    @patch.object(updater, 'APP_VERSION', '1.2.0')
+    @patch('urllib.request.urlopen')
+    def test_non_dict_manifest_ignored(self, mock_urlopen):
+        mock_urlopen.return_value = FakeResponse(b'[1, 2, 3]')
+        self.assertIsNone(updater.check_update())
+
+    @patch.object(updater, 'APP_VERSION', '1.2.0')
+    @patch('urllib.request.urlopen')
+    def test_bad_json_raises_update_error(self, mock_urlopen):
+        mock_urlopen.return_value = FakeResponse(b'not-json{')
+        with self.assertRaises(updater.UpdateError):
+            updater.check_update()
 
     @patch.object(updater, 'APP_VERSION', '1.2.0')
     @patch('urllib.request.urlopen')

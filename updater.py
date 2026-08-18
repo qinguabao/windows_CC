@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""自动更新模块：检查 GitHub Releases、下载新版（含 SHA-256 校验）、原地替换重启。
+"""自动更新模块：检查自建更新服务器（latest.json）、下载新版（含 SHA-256 校验）、原地替换重启。
 
 替换采用 Windows 通用的 rename-swap 方案（Squirrel/Electron 更新器同款思路）：
 正在运行的 EXE 可以被重命名但不能被删除，且 Windows 的 rename 不能跨盘
@@ -26,11 +26,11 @@ import time
 import urllib.error
 import urllib.request
 
-from version import APP_VERSION, GITHUB_REPO
+from version import APP_VERSION, UPDATE_BASE_URL
 
 logger = logging.getLogger('CCleaner')
 
-GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+MANIFEST_URL = f"{UPDATE_BASE_URL.rstrip('/')}/latest.json"
 UPDATE_DIR = os.path.join(tempfile.gettempdir(), 'CCleaner_update')
 
 
@@ -64,8 +64,16 @@ def _is_newer(remote_tag: str, local_version: str) -> bool:
         return False
 
 
+_HEX_DIGITS = set('0123456789abcdef')
+
+
+def _is_valid_sha256(value: str) -> bool:
+    """SHA-256 应为 64 位小写十六进制。"""
+    return len(value) == 64 and all(c in _HEX_DIGITS for c in value)
+
+
 def check_update() -> dict | None:
-    """检查是否有新版本。
+    """检查自建更新服务器上是否有新版本（latest.json）。
 
     Returns:
         dict with keys: version, tag, download_url, sha256, changelog, published_at
@@ -74,48 +82,45 @@ def check_update() -> dict | None:
     Raises:
         UpdateError: 网络请求失败（与"无更新"区分开，便于 UI 分别提示）。
     """
+    # 时间戳参数防止中间层缓存清单（HTTP 环境下尤其重要）
+    url = f'{MANIFEST_URL}?t={int(time.time())}'
     try:
         req = urllib.request.Request(
-            GITHUB_API_URL,
-            headers={
-                'Accept': 'application/vnd.github.v3+json',
-                'User-Agent': f'CCleaner-Pro/{APP_VERSION}',
-            },
+            url,
+            headers={'User-Agent': f'CCleaner-Pro/{APP_VERSION}'},
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode('utf-8'))
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as e:
         logger.debug(f'检查更新失败: {e}')
-        raise UpdateError(f'无法访问 GitHub API: {e}') from e
+        raise UpdateError(f'无法访问更新服务器: {e}') from e
 
-    tag = data.get('tag_name', '')
-    if not tag or not _is_newer(tag, APP_VERSION):
+    if not isinstance(data, dict):
+        logger.debug('更新清单格式无效')
         return None
 
-    # 查找 .exe 资产
-    download_url = None
-    sha256 = None
-    for asset in data.get('assets', []):
-        name = asset.get('name', '').lower()
-        if name.endswith('.exe'):
-            download_url = asset.get('browser_download_url')
-            # GitHub API 的 digest 形如 "sha256:abcdef..."
-            digest = asset.get('digest') or ''
-            if digest.lower().startswith('sha256:'):
-                sha256 = digest.split(':', 1)[1].strip().lower()
-            break
+    version = str(data.get('version') or '').strip()
+    download_url = str(data.get('url') or '').strip()
+    sha256 = str(data.get('sha256') or '').strip().lower()
 
-    if not download_url:
-        logger.debug('新版本无 EXE 资产')
+    if not version or not _is_newer(version, APP_VERSION):
+        return None
+    if not download_url.lower().endswith('.exe'):
+        logger.debug('更新清单下载地址无效')
+        return None
+    # HTTP 明文下载没有传输安全，SHA-256 是唯一的完整性保障；
+    # 缺失校验值的清单一律拒绝，防止被替换的安装包直接进入换名流程
+    if not _is_valid_sha256(sha256):
+        logger.debug('更新清单缺少有效 sha256，忽略')
         return None
 
     return {
-        'version': _parse_version(tag),
-        'tag': tag,
+        'version': _parse_version(version),
+        'tag': f'v{version.lstrip("vV")}',
         'download_url': download_url,
         'sha256': sha256,
-        'changelog': data.get('body', ''),
-        'published_at': data.get('published_at', ''),
+        'changelog': str(data.get('notes') or ''),
+        'published_at': str(data.get('date') or ''),
     }
 
 

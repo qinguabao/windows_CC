@@ -47,6 +47,9 @@ ENV/
 Thumbs.db
 Desktop.ini
 
-# 根目录散落的构建产物/打包文件（正式产物在 GitHub Releases）
+# 根目录散落的构建产物/打包文件（正式产物在更新服务器 / GitHub Releases）
 /*.exe
 /*.zip
+
+# 服务器部署配置（含服务器地址与账号信息，不入库；模板见 deploy.example.json）
+deploy.json
