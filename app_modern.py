@@ -23,13 +23,16 @@ from cleaner_logic import (
 )
 from settings import load_settings, save_settings
 from backup_manager import BackupManagerDialog
+from cleanup_history import add_record, CleanupHistoryDialog
 from storage_cleaner import StorageCleanerDialog
+from diagnostic import DiagnosticDialog
 from elevate import is_admin, relaunch_as_admin
 from version import APP_VERSION, UPDATE_BASE_URL
 
 APP_TITLE = f"C盘清理工具 Pro v{APP_VERSION}"
 # 高风险类别：默认不勾选，用户明确选择后才进入“清理选中项”。
-DANGEROUS = {'downloads'}
+DANGEROUS = {'downloads', 'gpu_shader_cache', 'patch_cache', 'event_logs',
+             'wxwork_cache', 'electron_cache', 'service_worker_cache'}
 
 
 def resource_path(rel):
@@ -60,6 +63,13 @@ CATEGORIES = {
     'messaging_cache': "通讯应用缓存", 'browser_extra': "其它浏览器缓存",
     'gaming_cache': "游戏娱乐缓存", 'tool_cache': "办公工具缓存",
     'docker_data': "Docker数据 (仅供查看)",
+    'dotnet_cache': ".NET框架缓存",
+    'gpu_shader_cache': "GPU着色器缓存 ⚠高风险",
+    'patch_cache': "Windows补丁缓存 ⚠高风险",
+    'event_logs': "Windows事件日志 ⚠高风险",
+    'wxwork_cache': "企业微信缓存 ⚠高风险",
+    'electron_cache': "Electron应用缓存 ⚠高风险",
+    'service_worker_cache': "浏览器ServiceWorker缓存 ⚠高风险",
     'large_files': "大文件 (>100MB，仅供查看)",
 }
 
@@ -101,8 +111,11 @@ QPushButton#secondary { background:#eef1f8; color:#33415c; }
 QPushButton#secondary:hover { background:#e2e7f3; }
 QPushButton#danger { background:#e5484d; }
 QPushButton#danger:hover { background:#d13438; }
-QTreeWidget { background:#fff; border:1px solid #e6e9f2; border-radius:12px; font-size:13px; }
-QTreeWidget::item { padding:5px; min-height: 22px; }
+QTreeWidget { background:#fff; border:1px solid #e6e9f2; border-radius:12px; font-size:13px; color:#1b2233; }
+QTreeWidget::item { padding:5px; min-height: 22px; color:#1b2233; }
+QTreeWidget QHeaderView::section { background:#f4f6fb; color:#3a4356; border:none; padding:4px 8px; font-size:12px; font-weight:600; }
+QMessageBox { background:#fff; }
+QMessageBox QLabel { color:#1b2233; }
 QTreeWidget::indicator { width: 18px; height: 18px; margin-right: 6px; border-radius: 4px; }
 QTreeWidget::indicator:unchecked { border: 2px solid #c4ccdd; background: #fff; }
 QTreeWidget::indicator:checked { border: 2px solid #4f7cff; background: #4f7cff; image: url("{{CHECK_IMG}}"); }
@@ -230,10 +243,6 @@ class ModernCleanerWindow(QMainWindow):
             from version import APP_VERSION
             self.statusBar().showMessage(f"已成功更新到 v{APP_VERSION}", 10000)
 
-        # 启动后延迟 3 秒自动检查更新
-        if self._user_settings.get('check_updates', True):
-            QTimer.singleShot(3000, self._auto_check_update)
-
     # ---------- UI ----------
     def _build_ui(self):
         root = QWidget()
@@ -292,6 +301,9 @@ class ModernCleanerWindow(QMainWindow):
         self.storage_btn = QPushButton("其它磁盘清理")
         self.storage_btn.setObjectName("secondary")
         self.storage_btn.clicked.connect(self.open_storage_cleaner)
+        self.diag_btn = QPushButton("深度诊断")
+        self.diag_btn.setObjectName("secondary")
+        self.diag_btn.clicked.connect(self.open_diagnostics)
         brow.addWidget(self.scan_btn)
         self.pause_btn = QPushButton("暂停")
         self.pause_btn.setObjectName("secondary")
@@ -306,6 +318,7 @@ class ModernCleanerWindow(QMainWindow):
         brow.addWidget(self.clean_sel_btn)
         brow.addWidget(self.clean_all_btn)
         brow.addWidget(self.storage_btn)
+        brow.addWidget(self.diag_btn)
         brow.addStretch()
         v.addLayout(brow)
 
@@ -322,6 +335,7 @@ class ModernCleanerWindow(QMainWindow):
         self.tree.setHeaderLabels(["项目", "大小", "路径"])
         self.tree.setColumnWidth(0, 260)
         self.tree.setColumnWidth(1, 90)
+        self.tree.header().setStretchLastSection(True)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         self.tree.itemChanged.connect(self._on_item_changed)
@@ -347,9 +361,13 @@ class ModernCleanerWindow(QMainWindow):
         self.backup_btn = QPushButton("备份管理")
         self.backup_btn.setObjectName("secondary")
         self.backup_btn.clicked.connect(self.open_backup_manager)
+        self.history_btn = QPushButton("清理历史")
+        self.history_btn.setObjectName("secondary")
+        self.history_btn.clicked.connect(self.open_history)
         orow.addWidget(self.simulate_cb)
         orow.addWidget(self.backup_cb)
         orow.addWidget(self.backup_btn)
+        orow.addWidget(self.history_btn)
         orow.addStretch()
         self.update_btn = QPushButton("检查更新")
         self.update_btn.setObjectName("secondary")
@@ -384,7 +402,9 @@ class ModernCleanerWindow(QMainWindow):
         self.clean_all_btn.setEnabled(
             not busy and bool(collect_one_click_items(self.scan_results)))
         self.backup_btn.setEnabled(not busy)
+        self.history_btn.setEnabled(not busy)
         self.storage_btn.setEnabled(not busy)
+        self.diag_btn.setEnabled(not busy)
         if busy and mode == 'scan':
             self.scan_btn.setText("扫描中…")
         elif busy and mode == 'clean':
@@ -402,6 +422,9 @@ class ModernCleanerWindow(QMainWindow):
     def open_backup_manager(self):
         BackupManagerDialog(self.cleaner, self).exec()
 
+    def open_history(self):
+        CleanupHistoryDialog(self, categories_map=CATEGORIES).exec()
+
     def open_storage_cleaner(self):
         StorageCleanerDialog(
             self.cleaner,
@@ -409,6 +432,10 @@ class ModernCleanerWindow(QMainWindow):
             simulate=self.simulate_cb.isChecked(),
             backup=self.backup_cb.isChecked(),
         ).exec()
+
+    def open_diagnostics(self):
+        """打开只读的深度诊断对话框（不会删除任何文件）。"""
+        DiagnosticDialog(self.cleaner, self).exec()
 
     def _has_checked(self):
         return len(self._collect_checked()) > 0
@@ -744,6 +771,7 @@ class ModernCleanerWindow(QMainWindow):
             'backup': self.backup_cb.isChecked(),
         })
         self._set_busy(True, mode='clean')
+        self._clean_items = items
         self.progress.setVisible(True)
         self.progress.setRange(0, len(items))
         self.progress.setValue(0)
@@ -786,6 +814,17 @@ class ModernCleanerWindow(QMainWindow):
             if not simulate and self.backup_cb.isChecked():
                 msg += "\n\n如需恢复已删除的文件，请点击下方「备份管理」按钮。"
             QMessageBox.information(self, title, msg)
+        # 保存清理历史记录
+        try:
+            add_record(
+                cleaned_items=res.get('cleaned_items', []),
+                errors=res.get('errors', []),
+                freed_space=freed,
+                simulate=simulate,
+                items=getattr(self, '_clean_items', []),
+            )
+        except Exception:
+            pass
         self.status.setText(f"{title}，{verb} {fmt_size(freed)}")
         self._refresh_disk()
         if not simulate:

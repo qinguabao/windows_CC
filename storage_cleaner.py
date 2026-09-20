@@ -51,6 +51,7 @@ class StorageScanThread(QThread):
             result = self.cleaner.scan_storage(
                 abort_callback=lambda: self._abort,
                 progress_callback=lambda path, count: self.progress.emit(path, count),
+                phase_callback=self.phase_changed.emit,
                 **self.options,
             )
         except Exception as e:
@@ -290,6 +291,7 @@ class StorageCleanerDialog(QDialog):
         }
         self._scan_thread = StorageScanThread(self.cleaner, options)
         self._scan_thread.progress.connect(self._scan_progress)
+        self._scan_thread.phase_changed.connect(self._scan_phase_changed)
         self._scan_thread.finished.connect(self._scan_finished)
         self._scan_thread.failed.connect(self._scan_failed)
         self._set_busy(True, scanning=True)
@@ -319,6 +321,9 @@ class StorageCleanerDialog(QDialog):
         self.status.setText(
             f"已扫描 {count} 个文件{rate_str}：{os.path.basename(path) or path}")
 
+    def _scan_phase_changed(self, phase):
+        self.status.setText(f"{phase}…")
+
     def _update_scan_elapsed(self):
         if not hasattr(self, '_scan_start_time'):
             return
@@ -340,7 +345,8 @@ class StorageCleanerDialog(QDialog):
         minutes, seconds = divmod(elapsed, 60)
         time_str = f"{minutes}分{seconds:02d}秒" if minutes else f"{seconds}秒"
         if results.get('aborted'):
-            self.status.setText(f"扫描已停止（耗时 {time_str}），当前显示停止前已完成的大文件结果。")
+            self.status.setText(
+                f"扫描已停止（耗时 {time_str}），当前显示停止前已完成的结果。")
         else:
             self.status.setText(f"扫描完成（耗时 {time_str}，共 {results.get('scanned_files', 0)} 个文件）。所有结果默认未选中，请核对路径后再清理。")
 
@@ -404,6 +410,7 @@ class StorageCleanerDialog(QDialog):
         self.duplicate_tree.blockSignals(False)
         large_count = len(results.get('large_files', []))
         duplicate_groups = results.get('duplicate_groups', [])
+        duplicate_scan = results.get('duplicate_scan', {})
         duplicate_reclaimable = sum(
             group['reclaimable_size'] for group in duplicate_groups)
         self.tabs.setTabText(0, f"大文件 ({large_count})")
@@ -411,8 +418,38 @@ class StorageCleanerDialog(QDialog):
         self._base_scan_summary = (
             f"已检查 {results.get('scanned_files', 0)} 个文件，"
             f"共 {format_size(results.get('scanned_size', 0))}；"
+            f"重复候选 {duplicate_scan.get('eligible_files', 0)} 个；"
+            f"快速匹配候选 {duplicate_scan.get('quick_match_files', 0)} 个；"
+            f"完整校验候选 {duplicate_scan.get('exact_candidates', 0)} 个；"
             f"重复文件最多可释放 {format_size(duplicate_reclaimable)}"
         )
+        if duplicate_scan.get('enabled') and not duplicate_groups:
+            minimum = format_size(duplicate_scan.get('min_size', 0))
+            eligible = duplicate_scan.get('eligible_files', 0)
+            size_matched = duplicate_scan.get('size_matched_files', 0)
+            unreadable = duplicate_scan.get('unreadable_files', 0)
+            if results.get('aborted'):
+                matched = duplicate_scan.get('size_matched_files', 0)
+                quick_done = duplicate_scan.get('quick_hashed_files', 0)
+                exact_done = duplicate_scan.get('exact_hashed_files', 0)
+                if quick_done == 0:
+                    reason = (
+                        f"扫描在重复校验开始前停止（候选 {eligible} 个，"
+                        "尚未完成内容校验）")
+                else:
+                    reason = (
+                        f"扫描中止时已完成快速校验 {quick_done}/{matched} 个、"
+                        f"完整校验 {exact_done} 个；"
+                        f"快速匹配候选 {duplicate_scan.get('quick_match_files', 0)} 个")
+            elif eligible == 0:
+                reason = f"没有文件达到 {minimum} 的重复扫描阈值"
+            elif size_matched == 0:
+                reason = "候选文件的大小均不相同"
+            elif unreadable:
+                reason = f"未发现内容完全相同的文件，另有 {unreadable} 个文件无法读取"
+            else:
+                reason = "候选文件内容并不完全相同"
+            self._base_scan_summary += f"；未发现重复文件：{reason}"
         self.scan_summary.setText(self._base_scan_summary)
         self._update_selected_summary()
 

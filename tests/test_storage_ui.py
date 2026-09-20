@@ -79,6 +79,52 @@ class StorageCleanerUiTests(unittest.TestCase):
         self.assertFalse(self.dialog.clean_button.isEnabled())
         self.assertIn("已选 0 个文件", self.dialog.selected_summary.text())
 
+    def test_empty_duplicate_result_explains_size_threshold(self):
+        results = {
+            "scan_root": "D:\\",
+            "large_files": [],
+            "duplicate_groups": [],
+            "duplicate_scan": {
+                "enabled": True,
+                "min_size": 10 * 1024 * 1024,
+                "eligible_files": 0,
+                "size_matched_files": 0,
+                "unreadable_files": 0,
+            },
+            "scanned_files": 20,
+            "scanned_size": 1024,
+            "errors": [],
+            "aborted": False,
+        }
+
+        self.dialog._populate_results(results)
+
+        self.assertIn("没有文件达到 10.00 MB", self.dialog.scan_summary.text())
+
+    def test_stopped_duplicate_scan_explains_unfinished_hashing(self):
+        results = {
+            "scan_root": "D:\\",
+            "large_files": [],
+            "duplicate_groups": [],
+            "duplicate_scan": {
+                "enabled": True,
+                "min_size": 1024 * 1024,
+                "eligible_files": 40275,
+                "size_matched_files": 0,
+                "quick_hashed_files": 0,
+                "exact_hashed_files": 0,
+                "unreadable_files": 0,
+            },
+            "scanned_files": 100,
+            "scanned_size": 1024,
+            "errors": [],
+            "aborted": True,
+        }
+
+        self.dialog._populate_results(results)
+
+        self.assertIn("尚未完成内容校验", self.dialog.scan_summary.text())
+
     def test_same_path_selected_in_both_views_is_counted_once(self):
         self.dialog.results = self._results()
         self.dialog._populate_results(self.dialog.results)

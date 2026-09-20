@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 import glob
@@ -40,8 +41,13 @@ DEFAULT_MAX_BACKUPS = 5
 DEFAULT_MAX_BACKUP_SIZE = 20 * 1024 * 1024 * 1024  # 20 GiB，按清理批次保存的总容量目标
 
 
+# 深度诊断条目专用类型：只读展示，绝不能进入删除路径。
+DIAGNOSTIC_ITEM_TYPE = 'diagnostic_only'
+
 # 这些类别只能用于分析展示，任何调用方都不能把它们交给删除核心。
-ANALYSIS_ONLY_CATEGORIES = frozenset({'large_files', 'ai_models', 'docker_data'})
+ANALYSIS_ONLY_CATEGORIES = frozenset({
+    'large_files', 'ai_models', 'docker_data', DIAGNOSTIC_ITEM_TYPE,
+})
 
 # 这些系统维护场景不适合通过递归删除实现，应使用 Windows 官方维护接口。
 DISABLED_CLEANUP_CATEGORIES = frozenset({
@@ -54,6 +60,8 @@ DISABLED_CLEANUP_CATEGORIES = frozenset({
     'driver_backup',
     'windows_defender',
     'installer_cache',
+    'patch_cache',
+    'event_logs',
 })
 
 # 其它磁盘分析结果可以清理，但必须走专用的盘符/范围校验。
@@ -70,6 +78,220 @@ STORAGE_PROTECTED_ROOTS = frozenset({
     'program files (x86)',
     'programdata',
 })
+
+
+# ─── 深度诊断：统计清理工具覆盖不到的占用（只读，绝不删除任何文件）──────────
+
+DIAGNOSTIC_GROUPS = {
+    'db': '数据库日志与数据',
+    'appdata': '应用数据与运行时',
+    'cloud': '云盘同步目录',
+    'system': '系统与镜像残留',
+    'ide': 'IDE / 编辑器缓存',
+}
+DIAGNOSTIC_GROUP_ORDER = ('db', 'appdata', 'cloud', 'system', 'ide')
+
+_DIAG_TOP_THRESHOLD = 200 * 1024 * 1024   # 动态 Top 榜的子目录门槛
+_DIAG_TOP_LIMIT = 12
+
+# 云端「按需文件」属性：读取会触发下载，统计时必须跳过。
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+# reparse point（junction / symlink）属性，避免重复遍历。
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _diag_env(env=None):
+    """收集诊断需要的根路径。全部走环境变量，兼容文件夹重定向与测试替换。"""
+    src = env if env is not None else os.environ
+    windows = src.get('SystemRoot') or src.get('WINDIR') or r'C:\Windows'
+    drive = os.path.splitdrive(windows)[0] + os.sep if os.path.splitdrive(windows)[0] else 'C:\\'
+    return {
+        'appdata': src.get('APPDATA', ''),
+        'local': src.get('LOCALAPPDATA', ''),
+        'profile': src.get('USERPROFILE', ''),
+        'programdata': src.get('ProgramData') or src.get('PROGRAMDATA') or r'C:\ProgramData',
+        'programfiles': src.get('ProgramFiles') or src.get('PROGRAMFILES') or r'C:\Program Files',
+        'windows': windows,
+        'drive': drive,
+    }
+
+
+def build_diagnostic_probes(env=None):
+    """构建深度诊断探针表。
+
+    每个探针是 dict：group/name/kind/suggestion 为通用字段，kind 取值为
+    'dir' | 'glob' | 'files' | 'dynamic_top' | 'note_only'。
+    路径全部来自环境变量，便于在测试中替换为临时目录。
+    """
+    e = _diag_env(env)
+    appdata, local, profile = e['appdata'], e['local'], e['profile']
+    programdata, programfiles = e['programdata'], e['programfiles']
+    windows, drive = e['windows'], e['drive']
+    probes = []
+
+    def add(group, name, kind, suggestion, path='', **extra):
+        probe = {'group': group, 'name': name, 'kind': kind,
+                 'path': path, 'suggestion': suggestion}
+        probe.update(extra)
+        probes.append(probe)
+
+    # ---------- 1. 数据库日志与数据 ----------
+    for server_dir in sorted(glob.glob(os.path.join(programdata, 'MySQL', 'MySQL Server*'))):
+        data_dir = os.path.join(server_dir, 'Data')
+        if not os.path.isdir(data_dir):
+            continue
+        product = os.path.basename(server_dir)
+        add('db', f'MySQL 数据目录（{product}）', 'dir',
+            '数据库数据，请勿手动删除；要释放空间优先处理二进制日志（binlog）。',
+            path=data_dir, budget=60)
+        add('db', f'MySQL 二进制日志 binlog（{product}）', 'glob',
+            '关闭日志：在 my.ini 注释 log-bin 并重启 MySQL；'
+            '或设置 binlog_expire_logs_seconds 控制保留天数。'
+            '清理用 SQL：PURGE BINARY LOGS BEFORE NOW() - INTERVAL 3 DAY; '
+            '切勿手动删除 Data 目录下的 -bin.0000xx 文件。',
+            path=data_dir, pattern='*-bin.[0-9]*',
+            inspect='mysql_log_bin', server_dir=server_dir)
+    for server_dir in sorted(glob.glob(os.path.join(programdata, 'MariaDB*'))):
+        data_dir = os.path.join(server_dir, 'data')
+        if os.path.isdir(data_dir):
+            add('db', f'MariaDB 数据目录（{os.path.basename(server_dir)}）', 'dir',
+                '数据库数据，请勿手动删除；二进制日志可用 PURGE BINARY LOGS 清理。',
+                path=data_dir, budget=60)
+    for pg_data in sorted(glob.glob(os.path.join(programfiles, 'PostgreSQL', '*', 'data'))):
+        if os.path.isdir(pg_data):
+            add('db', 'PostgreSQL 数据目录', 'dir',
+                '数据库数据，请勿手动删除；可用 VACUUM 回收空间。', path=pg_data, budget=60)
+    for mssql in sorted(glob.glob(os.path.join(programfiles, 'Microsoft SQL Server', '*', 'MSSQL', 'DATA'))):
+        if os.path.isdir(mssql):
+            add('db', 'SQL Server 数据库文件', 'dir',
+                '数据库数据，请勿手动删除；收缩请用 DBCC SHRINKDATABASE。',
+                path=mssql, budget=60)
+
+    # ---------- 2. 应用数据与运行时 ----------
+    if appdata:
+        add('appdata', 'Roaming 应用数据', 'dynamic_top',
+            '应用配置与数据：缓存类可清，config/配置目录请保留；也可迁移到其它磁盘。',
+            base=appdata, threshold=_DIAG_TOP_THRESHOLD, limit=_DIAG_TOP_LIMIT)
+    if local:
+        add('appdata', 'LocalAppData', 'dynamic_top',
+            '应用本地数据：缓存类可清，config/配置目录请保留；也可迁移到其它磁盘。',
+            base=local, threshold=_DIAG_TOP_THRESHOLD, limit=_DIAG_TOP_LIMIT)
+    if profile:
+        for label, parts in (
+            ('nvm（Node 版本）', ('nvm',)),
+            ('npm 缓存', ('.npm',)),
+            ('.nuget 包缓存', ('.nuget', 'packages')),
+            ('.gradle 构建缓存', ('.gradle',)),
+            ('.m2 仓库缓存', ('.m2',)),
+        ):
+            add('appdata', label, 'dir',
+                '运行时 / 构建缓存，可安全清理或迁移到其它磁盘。',
+                path=os.path.join(profile, *parts))
+    if local:
+        for label, parts in (
+            ('pip 缓存', ('pip', 'cache')),
+            ('uv 缓存', ('uv',)),
+            ('ms-playwright 浏览器', ('ms-playwright',)),
+            ('npm-cache', ('npm-cache',)),
+        ):
+            add('appdata', label, 'dir',
+                '包管理器 / 运行时缓存，可安全清理，需要时会自动重新下载。',
+                path=os.path.join(local, *parts))
+
+    # ---------- 3. 云盘同步目录 ----------
+    if profile:
+        for label, parts in (
+            ('WPS Cloud Files', ('WPS Cloud Files',)),
+            ('WPSDrive', ('WPSDrive',)),
+            ('OneDrive', ('OneDrive',)),
+            ('坚果云', ('Nutstore',)),
+            ('Dropbox', ('Dropbox',)),
+            ('百度网盘下载', ('BaiduNetdiskDownload',)),
+        ):
+            add('cloud', label, 'dir',
+                '云盘同步 / 占位目录：请在客户端内改存储盘或「释放空间」，不要直接删除文件；'
+                '主界面只能清理其中部分日志缓存。',
+                path=os.path.join(profile, *parts), budget=45)
+        for extra in sorted(glob.glob(os.path.join(profile, 'OneDrive*'))):
+            if os.path.basename(extra).lower() != 'onedrive':
+                add('cloud', f'OneDrive（{os.path.basename(extra)}）', 'dir',
+                    '云盘同步目录：请在 OneDrive 设置中改存储盘或「释放空间」。',
+                    path=extra, budget=45)
+
+    # ---------- 4. 系统与镜像残留 ----------
+    add('system', 'WinSxS 组件存储', 'dir',
+        '请勿手动删除。用管理员执行：'
+        'DISM /Online /Cleanup-Image /StartComponentCleanup',
+        path=os.path.join(windows, 'WinSxS'), budget=70, max_dirs=200000)
+    add('system', 'Windows\\Installer 安装缓存', 'dir',
+        '请勿手动删除，可能导致程序无法卸载 / 修复；用官方工具处理。',
+        path=os.path.join(windows, 'Installer'), budget=45)
+    add('system', 'Windows.old（旧系统）', 'dir',
+        '用「设置 → 系统 → 存储 → 临时文件」或磁盘清理删除。',
+        path=os.path.join(drive, 'Windows.old'), budget=45)
+    add('system', '$WINDOWS.~BT（升级临时）', 'dir',
+        '系统升级残留，可用磁盘清理删除。',
+        path=os.path.join(drive, '$WINDOWS.~BT'), budget=30)
+    add('system', '页面文件 / 休眠文件', 'files',
+        '页面文件由系统管理；不需要休眠可用 `powercfg /h off` 关闭以释放 hiberfil.sys。',
+        paths=[os.path.join(drive, 'pagefile.sys'),
+               os.path.join(drive, 'hiberfil.sys'),
+               os.path.join(drive, 'swapfile.sys')])
+    add('system', '系统还原点 / 卷影副本', 'note_only',
+        '需管理员查看与调整：vssadmin list shadowstorage；'
+        '可在「系统属性 → 系统保护」限制其最大占用。',
+        note='需管理员权限查看')
+    if local:
+        add('system', 'Android SDK 系统镜像', 'dir',
+            'Android 模拟器系统镜像：不用的镜像可在 SDK Manager 中删除。',
+            path=os.path.join(local, 'Android', 'Sdk', 'system-images'), budget=45)
+    add('system', 'Android 模拟器镜像（应用内置）', 'dir',
+        '应用内置的模拟器镜像：不使用该模拟器可直接卸载对应组件。',
+        path=os.path.join(programfiles, 'MobileAppEngine'), budget=30)
+    add('system', 'Docker 安装镜像 / 资源', 'glob',
+        'Docker 自带资源文件，随 Docker 安装存在；卸载 Docker 即可回收。',
+        path=os.path.join(programfiles, 'Docker', 'Docker', 'resources'), pattern='*.iso')
+    for label, parts in (
+        ('驱动 / 更新包残留 (Comms)', ('Comms',)),
+        ('Intel 驱动下载缓存 (DSA)', ('Intel', 'DSA', 'Downloads')),
+        ('Visual Studio 包缓存 (Package Cache)', ('Package Cache',)),
+    ):
+        add('system', label, 'dir',
+            '下载的驱动 / 更新包残留，确认无需回滚后可删除。',
+            path=os.path.join(programdata, *parts), budget=30)
+
+    # ---------- 5. IDE / 编辑器缓存 ----------
+    if local:
+        add('ide', 'JetBrains 本地数据', 'dynamic_top',
+            '其中 caches/log/index/tmp 可由主界面「IDE开发工具缓存」清理；'
+            'config/system/plugins 请保留。',
+            base=os.path.join(local, 'JetBrains'),
+            threshold=100 * 1024 * 1024, limit=_DIAG_TOP_LIMIT)
+    if appdata:
+        add('ide', 'JetBrains 配置数据', 'dynamic_top',
+            '配置 / 插件目录，请保留；如需迁移可在 IDE 内更改数据目录。',
+            base=os.path.join(appdata, 'JetBrains'),
+            threshold=100 * 1024 * 1024, limit=_DIAG_TOP_LIMIT)
+    if profile:
+        add('ide', '.vscode 扩展', 'dir',
+            'VS Code 扩展目录：按需保留，删除后需重新安装。',
+            path=os.path.join(profile, '.vscode', 'extensions'))
+        add('ide', '.eclipse', 'dir',
+            'Eclipse 工作区 / 缓存数据。',
+            path=os.path.join(profile, '.eclipse'))
+    for base_dir, label in ((appdata, 'Roaming'), (local, 'Local')):
+        if not base_dir:
+            continue
+        for app in ('Code', 'Code - Insiders', 'CodeBuddy CN', 'Trae CN',
+                    'Qoder', 'Cursor'):
+            add('ide', f'{app}（{label}）', 'dir',
+                '编辑器数据：Cache/CachedData/logs 类可由主界面清理，其余为配置请保留。',
+                path=os.path.join(base_dir, app))
+    if local:
+        add('ide', 'Sublime Text 缓存', 'dir',
+            '编辑器缓存与插件数据，Cache 目录可安全清理。',
+            path=os.path.join(local, 'Sublime Text'))
+    return probes
 
 
 class BackupError(RuntimeError):
@@ -292,9 +514,12 @@ class CleanerLogic:
         digest = hashlib.sha256()
         chunk_size = 1024 * 1024
         try:
+            if abort_callback and abort_callback():
+                return None, True
             with open(path, 'rb') as handle:
                 if quick:
-                    sample_size = 64 * 1024
+                    # 这里只是预筛选；最终仍会做完整 SHA-256，因此采样越小越快且不会产生误报。
+                    sample_size = 8 * 1024
                     digest.update(handle.read(sample_size))
                     if size > sample_size:
                         handle.seek(max(0, size - sample_size))
@@ -312,10 +537,50 @@ class CleanerLogic:
         except (OSError, ValueError):
             return None, False
 
+    def _hash_storage_records(self, executor, records, size, quick,
+                              abort_callback=None, completed_callback=None,
+                              max_pending=2):
+        """使用固定大小的任务窗口哈希，避免为整盘候选一次性创建 Future。"""
+        record_iter = iter(records)
+        pending = {}
+
+        def submit_next():
+            try:
+                record = next(record_iter)
+            except StopIteration:
+                return False
+            future = executor.submit(
+                self._file_hash,
+                record['path'], size, quick, abort_callback,
+            )
+            pending[future] = record
+            return True
+
+        for _ in range(max(1, int(max_pending))):
+            if not submit_next():
+                break
+        hashed = []
+        while pending:
+            done, _ = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                record = pending.pop(future)
+                digest, aborted = future.result()
+                if completed_callback:
+                    completed_callback(record, digest)
+                if aborted:
+                    for remaining in pending:
+                        remaining.cancel()
+                    return hashed, True
+                if digest:
+                    hashed.append((record, digest))
+                submit_next()
+        return hashed, False
+
     def scan_storage(self, scan_root, min_large_size=1024 * 1024 * 1024,
                      min_duplicate_size=1024 * 1024, find_large=True,
                      find_duplicates=True, abort_callback=None,
-                     progress_callback=None):
+                     progress_callback=None, phase_callback=None):
         """一次遍历分析其它磁盘中的大文件和内容重复文件。"""
         root = os.path.realpath(os.path.abspath(scan_root))
         if not os.path.isdir(root):
@@ -341,99 +606,188 @@ class CleanerLogic:
             'scanned_size': 0,
             'errors': [],
             'aborted': False,
+            'duplicate_scan': {
+                'enabled': bool(find_duplicates),
+                'min_size': min_duplicate_size,
+                'eligible_files': 0,
+                'size_matched_files': 0,
+                'quick_hashed_files': 0,
+                'exact_hashed_files': 0,
+                'quick_match_files': 0,
+                'quick_match_groups': 0,
+                'exact_candidates': 0,
+                'unreadable_files': 0,
+            },
         }
-        duplicate_candidates = []
+        duplicate_by_size = {}
         seen_files = set()
+        backup_norm = os.path.normcase(
+            os.path.normpath(os.path.realpath(self.backup_dir)))
+        directories = [(root, True)]
 
-        for current_root, dirs, files in os.walk(root, topdown=True, followlinks=False):
-            if abort_callback and abort_callback():
-                result['aborted'] = True
-                return result
-            dirs[:] = [
-                name for name in dirs
-                if self._storage_scan_directory_allowed(
-                    root, os.path.join(current_root, name))
-            ]
-            for name in files:
-                if abort_callback and abort_callback():
-                    result['aborted'] = True
-                    return result
-                path = os.path.join(current_root, name)
-                try:
-                    if os.path.islink(path) or not os.path.isfile(path):
+        if phase_callback:
+            phase_callback('正在枚举磁盘文件')
+
+        while directories:
+            current_root, is_scan_root = directories.pop()
+            try:
+                entries = os.scandir(current_root)
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+            with entries:
+                for entry in entries:
+                    if abort_callback and abort_callback():
+                        result['aborted'] = True
+                        return result
+                    path = entry.path
+                    try:
+                        stat_result = entry.stat(follow_symlinks=False)
+                        attributes = getattr(stat_result, 'st_file_attributes', 0)
+                        if stat.S_ISLNK(stat_result.st_mode) or attributes & 0x400:
+                            continue
+                        if stat.S_ISDIR(stat_result.st_mode):
+                            directory_norm = os.path.normcase(os.path.normpath(path))
+                            if (directory_norm == backup_norm
+                                    or directory_norm.startswith(backup_norm + os.sep)):
+                                continue
+                            if (is_scan_root
+                                    and entry.name.lower() in STORAGE_PROTECTED_ROOTS):
+                                continue
+                            directories.append((path, False))
+                            continue
+                        if not stat.S_ISREG(stat_result.st_mode):
+                            continue
+                        identity = ((stat_result.st_dev, stat_result.st_ino)
+                                    if stat_result.st_ino else
+                                    ('path', os.path.normcase(os.path.normpath(path))))
+                        if identity in seen_files:
+                            continue
+                        seen_files.add(identity)
+                        size = stat_result.st_size
+                        result['scanned_files'] += 1
+                        result['scanned_size'] += size
+                        is_large = find_large and size >= min_large_size
+                        is_duplicate = find_duplicates and size >= min_duplicate_size
+                        if progress_callback and result['scanned_files'] % 100 == 0:
+                            progress_callback(path, result['scanned_files'])
+                        if not is_large and not is_duplicate:
+                            continue
+                        record = {
+                            'path': path,
+                            'size': size,
+                            'scan_root': root,
+                            'modified': datetime.datetime.fromtimestamp(
+                                stat_result.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                            'extension': os.path.splitext(entry.name)[1].lower(),
+                        }
+                        if is_large:
+                            large_item = dict(record, type='storage_large_file')
+                            record['large_item'] = large_item
+                            result['large_files'].append(large_item)
+                        if is_duplicate:
+                            duplicate_by_size.setdefault(size, []).append(record)
+                            result['duplicate_scan']['eligible_files'] += 1
+                    except (PermissionError, FileNotFoundError):
                         continue
-                    stat_result = os.stat(path, follow_symlinks=False)
-                    attributes = getattr(stat_result, 'st_file_attributes', 0)
-                    if attributes & 0x400:
-                        continue
-                    identity = ((stat_result.st_dev, stat_result.st_ino)
-                                if stat_result.st_ino else
-                                ('path', os.path.normcase(os.path.realpath(path))))
-                    if identity in seen_files:
-                        continue
-                    seen_files.add(identity)
-                    size = stat_result.st_size
-                    result['scanned_files'] += 1
-                    result['scanned_size'] += size
-                    record = {
-                        'path': path,
-                        'size': size,
-                        'scan_root': root,
-                        'modified': datetime.datetime.fromtimestamp(
-                            stat_result.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
-                        'extension': os.path.splitext(path)[1].lower(),
-                    }
-                    if find_large and size >= min_large_size:
-                        large_item = dict(record, type='storage_large_file')
-                        record['large_item'] = large_item
-                        result['large_files'].append(large_item)
-                    if find_duplicates and size >= min_duplicate_size:
-                        duplicate_candidates.append(record)
-                    if progress_callback and result['scanned_files'] % 100 == 0:
-                        progress_callback(path, result['scanned_files'])
-                except (PermissionError, FileNotFoundError):
-                    continue
-                except OSError as e:
-                    if len(result['errors']) < 100:
-                        result['errors'].append({'path': path, 'error': str(e)})
+                    except OSError as e:
+                        if len(result['errors']) < 100:
+                            result['errors'].append({'path': path, 'error': str(e)})
 
         result['large_files'].sort(key=lambda item: item['size'], reverse=True)
         if not find_duplicates or result['aborted']:
             return result
 
-        by_size = {}
-        for record in duplicate_candidates:
-            by_size.setdefault(record['size'], []).append(record)
-
         duplicate_groups = []
-        for size, same_size_records in by_size.items():
-            if len(same_size_records) < 2:
-                continue
-            quick_groups = {}
-            for record in same_size_records:
-                digest, aborted = self._file_hash(
-                    record['path'], size, True, abort_callback)
+        result['duplicate_groups'] = duplicate_groups
+        size_groups = [
+            (size, records) for size, records in duplicate_by_size.items()
+            if len(records) > 1
+        ]
+        stats = result['duplicate_scan']
+        stats['size_matched_files'] = sum(
+            len(records) for _, records in size_groups)
+        unreadable_paths = set()
+
+        def make_progress_callback(stage, total):
+            completed = 0
+            report_step = max(1, total // 100)
+
+            def completed_one(record, digest):
+                nonlocal completed
+                completed += 1
+                if digest is None:
+                    unreadable_paths.add(record['path'])
+                    if len(result['errors']) < 100:
+                        result['errors'].append({
+                            'path': record['path'],
+                            'error': '无法读取文件内容，已跳过重复校验',
+                        })
+                if (phase_callback
+                        and (completed == total or completed % report_step == 0)):
+                    phase_callback(f'{stage}（{completed}/{total}）')
+
+            return completed_one
+
+        if phase_callback:
+            phase_callback(
+                f"正在快速筛选重复文件（0/{stats['size_matched_files']}）")
+        quick_groups = []
+        quick_executor = None
+        exact_executor = None
+        try:
+            if size_groups:
+                # 快速采样只读取文件首尾少量数据，适合稍高并发；完整哈希仍限制为 2 路。
+                quick_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+            quick_progress = make_progress_callback(
+                '正在快速筛选重复文件', stats['size_matched_files'])
+            for size, same_size_records in size_groups:
+                hashed, aborted = self._hash_storage_records(
+                    quick_executor, same_size_records, size, True, abort_callback,
+                    quick_progress,
+                    max_pending=4,
+                )
+                stats['quick_hashed_files'] += len(hashed)
                 if aborted:
                     result['aborted'] = True
                     return result
-                if digest:
-                    quick_groups.setdefault(digest, []).append(record)
-            for quick_records in quick_groups.values():
-                if len(quick_records) < 2:
-                    continue
+                by_quick_digest = {}
+                for record, digest in hashed:
+                    by_quick_digest.setdefault(digest, []).append(record)
+                quick_groups.extend(
+                    (size, records) for records in by_quick_digest.values()
+                    if len(records) > 1
+                )
+                stats['quick_match_files'] = sum(
+                    len(records) for _, records in quick_groups)
+                stats['quick_match_groups'] = len(quick_groups)
+
+            exact_total = sum(len(records) for _, records in quick_groups)
+            stats['exact_candidates'] = exact_total
+            if phase_callback:
+                phase_callback(f'正在校验重复文件内容（0/{exact_total}）')
+            exact_progress = make_progress_callback(
+                '正在校验重复文件内容', exact_total)
+            if quick_groups:
+                exact_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            for size, quick_records in quick_groups:
+                groups_before = len(duplicate_groups)
+                hashed, aborted = self._hash_storage_records(
+                    exact_executor,
+                    quick_records, size, False, abort_callback,
+                    exact_progress,
+                )
+                stats['exact_hashed_files'] += len(hashed)
+                if aborted:
+                    result['aborted'] = True
+                    return result
                 exact_groups = {}
-                for record in quick_records:
-                    digest, aborted = self._file_hash(
-                        record['path'], size, False, abort_callback)
-                    if aborted:
-                        result['aborted'] = True
-                        return result
-                    if digest:
-                        exact_groups.setdefault(digest, []).append(record)
+                for record, digest in hashed:
+                    exact_groups.setdefault(digest, []).append(record)
                 for digest, exact_records in exact_groups.items():
                     if len(exact_records) < 2:
                         continue
-                    exact_records.sort(key=lambda item: (item['modified'], item['path']))
+                    exact_records.sort(
+                        key=lambda item: (item['modified'], item['path']))
                     group_id = f'{size}:{digest}'
                     group_files = []
                     for index, record in enumerate(exact_records):
@@ -458,10 +812,295 @@ class CleanerLogic:
                         'reclaimable_size': size * (len(group_files) - 1),
                         'files': group_files,
                     })
-        duplicate_groups.sort(
-            key=lambda group: group['reclaimable_size'], reverse=True)
-        result['duplicate_groups'] = duplicate_groups
+                group_count = len(duplicate_groups)
+                if (phase_callback and group_count > groups_before
+                        and (group_count <= 10 or group_count % 100 == 0)):
+                    phase_callback(
+                        f'正在校验重复文件内容（已确认 {group_count} 组）')
+        finally:
+            stats['unreadable_files'] = len(unreadable_paths)
+            duplicate_groups.sort(
+                key=lambda group: group['reclaimable_size'], reverse=True)
+            for executor in (quick_executor, exact_executor):
+                if executor is not None:
+                    executor.shutdown(wait=True, cancel_futures=True)
         return result
+
+    # ==================== 深度诊断（只读） ====================
+
+    def scan_diagnostics(self, progress_callback=None, abort_callback=None,
+                         probes=None, deadline_seconds=180, probe_budget=30):
+        """只读诊断：统计清理工具覆盖不到的占用大户。
+
+        返回 `list[dict]`，字段为
+        group/name/path/size/file_count/exists/accessible/incomplete/suggestion/note。
+
+        安全性：返回的条目类型是 `DIAGNOSTIC_ITEM_TYPE`，而该类型已加入
+        ANALYSIS_ONLY_CATEGORIES，clean_selected() 会以「仅供查看」为由拒绝，
+        因此这些结果天然无法进入删除路径。本方法不创建、不修改、不删除任何文件。
+
+        每个探针有独立时间预算 probe_budget 秒（可用探针的 'budget' 覆盖），
+        超预算的探针会被标记 incomplete=True 而不是静默给出偏小的数字。
+        """
+        probe_list = list(probes) if probes is not None else build_diagnostic_probes()
+        global_deadline = (time.monotonic() + deadline_seconds) if deadline_seconds else None
+        total = max(1, len(probe_list))
+        results = []
+        for index, probe in enumerate(probe_list):
+            if abort_callback and abort_callback():
+                break
+            if progress_callback:
+                progress_callback(probe.get('name', ''), int(index / total * 100))
+            budget = probe.get('budget', probe_budget)
+            probe_deadline = time.monotonic() + budget
+            if global_deadline is not None:
+                probe_deadline = min(probe_deadline, global_deadline)
+            try:
+                results.extend(self._run_diagnostic_probe(probe, probe_deadline, abort_callback))
+            except Exception as exc:  # 单个探针异常不应中断整轮诊断
+                logger.warning(f"诊断探针失败（{probe.get('name')}）: {exc}")
+                results.append({
+                    'type': DIAGNOSTIC_ITEM_TYPE,
+                    'group': probe.get('group', ''),
+                    'name': probe.get('name', ''),
+                    'path': str(probe.get('path', '')),
+                    'size': 0,
+                    'file_count': 0,
+                    'exists': True,
+                    'accessible': False,
+                    'incomplete': True,
+                    'failed': True,
+                    'suggestion': probe.get('suggestion', ''),
+                    'note': f'诊断失败：{exc}',
+                })
+        if progress_callback:
+            progress_callback('', 100)
+        return results
+
+    def _run_diagnostic_probe(self, probe, deadline, abort_callback):
+        """执行单个探针，返回 0..N 个只读诊断条目。"""
+        item = {
+            'type': DIAGNOSTIC_ITEM_TYPE,
+            'group': probe.get('group', ''),
+            'name': probe.get('name', ''),
+            'path': probe.get('path', ''),
+            'size': 0,
+            'file_count': 0,
+            'exists': False,
+            'accessible': True,
+            'incomplete': False,
+            'failed': False,
+            'suggestion': probe.get('suggestion', ''),
+            'note': self._diagnose_note(probe),
+        }
+        kind = probe.get('kind', 'dir')
+
+        if kind == 'note_only':
+            item['exists'] = True
+            item['note'] = probe.get('note') or '需管理员权限查看'
+            return [item]
+
+        if kind == 'dynamic_top':
+            return self._diagnose_dynamic_top(probe, item, deadline, abort_callback)
+
+        if kind == 'files':
+            existing = [p for p in (probe.get('paths') or []) if os.path.exists(p)]
+            if not existing:
+                return [item]
+            item['exists'] = True
+            item['size'], item['file_count'] = self._sum_file_sizes(existing)
+            item['path'] = ' | '.join(existing)
+            return [item]
+
+        if kind == 'glob':
+            directory = probe.get('path', '')
+            pattern = os.path.join(directory, probe.get('pattern', '*'))
+            if not directory or not os.path.isdir(directory):
+                return [item]
+            item['exists'] = True
+            matches = glob.glob(pattern)
+            item['size'], item['file_count'] = self._sum_file_sizes(matches)
+            notes = [text for text in (item['note'], f'匹配 {len(matches)} 个文件') if text]
+            item['note'] = '；'.join(notes)
+            return [item]
+
+        # kind == 'dir'
+        path = probe.get('path', '')
+        if not path or not os.path.isdir(path):
+            return [item]
+        item['exists'] = True
+        info = self._measure_tree(path, deadline, abort_callback,
+                                  max_dirs=probe.get('max_dirs'))
+        item['size'] = info['size']
+        item['file_count'] = info['file_count']
+        item['accessible'] = info['root_accessible']
+        item['incomplete'] = info['incomplete']
+        if info['cloud_placeholder']:
+            item['note'] = '含云端占位文件，实际更大（未触发下载）'
+        return [item]
+
+    def _diagnose_dynamic_top(self, probe, base_item, deadline, abort_callback):
+        """枚举一级子目录，返回占用超过门槛、按大小降序的前 N 项。"""
+        base = probe.get('base', '')
+        if not base or not os.path.isdir(base):
+            return []
+        threshold = probe.get('threshold', _DIAG_TOP_THRESHOLD)
+        limit = probe.get('limit', _DIAG_TOP_LIMIT)
+        try:
+            entries = list(os.scandir(base))
+        except (PermissionError, FileNotFoundError, OSError):
+            item = dict(base_item)
+            item.update({'exists': True, 'path': base, 'accessible': False,
+                         'note': '无权限读取'})
+            return [item]
+
+        found = []
+        for entry in entries:
+            if abort_callback and abort_callback():
+                break
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            info = self._measure_tree(entry.path, deadline, abort_callback)
+            if info['root_accessible'] and info['size'] >= threshold:
+                found.append((entry.path, info))
+        found.sort(key=lambda pair: pair[1]['size'], reverse=True)
+
+        items = []
+        for path, info in found[:limit]:
+            item = dict(base_item)
+            item.update({
+                'name': f"{base_item['name']} · {os.path.basename(path)}",
+                'path': path,
+                'size': info['size'],
+                'file_count': info['file_count'],
+                'exists': True,
+                'accessible': True,
+                'incomplete': info['incomplete'],
+            })
+            if info['cloud_placeholder']:
+                item['note'] = '含云端占位文件，实际更大（未触发下载）'
+            items.append(item)
+        if len(found) > limit:
+            rest = found[limit:]
+            item = dict(base_item)
+            item.update({
+                'name': f"{base_item['name']} · 其余 {len(rest)} 个子目录",
+                'path': base,
+                'size': sum(pair[1]['size'] for pair in rest),
+                'file_count': sum(pair[1]['file_count'] for pair in rest),
+                'exists': True,
+                'accessible': True,
+                'incomplete': True,
+                'note': '仅列出占用最大的若干项',
+            })
+            items.append(item)
+        return items
+
+    def _measure_tree(self, root, deadline=None, abort_callback=None, max_dirs=None):
+        """只读统计目录占用。
+
+        跳过 reparse point（junction/symlink）并按 (st_dev, st_ino) 去重硬链接，
+        否则 WinSxS 等硬链接会把大小虚报数倍。跳过云端占位文件以免触发下载。
+        """
+        info = {'size': 0, 'file_count': 0, 'root_accessible': True,
+                'incomplete': False, 'cloud_placeholder': False}
+        try:
+            with os.scandir(root):
+                pass
+        except (PermissionError, FileNotFoundError, OSError):
+            info['root_accessible'] = False
+            return info
+
+        seen = set()
+        stack = [root]
+        dir_count = 0
+        while stack:
+            if abort_callback and abort_callback():
+                info['incomplete'] = True
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                info['incomplete'] = True
+                break
+            if max_dirs is not None and dir_count >= max_dirs:
+                info['incomplete'] = True
+                break
+            current = stack.pop()
+            dir_count += 1
+            try:
+                entries = os.scandir(current)
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+            with entries:
+                for entry in entries:
+                    if abort_callback and abort_callback():
+                        info['incomplete'] = True
+                        return info
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except (PermissionError, FileNotFoundError, OSError):
+                        continue
+                    attributes = getattr(st, 'st_file_attributes', 0)
+                    if stat.S_ISLNK(st.st_mode) or attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                        continue
+                    if attributes & _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS:
+                        info['cloud_placeholder'] = True
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(entry.path)
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    identity = ((st.st_dev, st.st_ino) if st.st_ino
+                                else ('path', os.path.normcase(os.path.normpath(entry.path))))
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    info['size'] += st.st_size
+                    info['file_count'] += 1
+        return info
+
+    @staticmethod
+    def _sum_file_sizes(paths):
+        """只读累加一组文件的字节数与文件数。"""
+        total = 0
+        count = 0
+        for path in paths:
+            try:
+                st = os.stat(path)
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
+                count += 1
+        return total, count
+
+    @staticmethod
+    def _diagnose_note(probe):
+        """探针的动态备注（目前仅用于反映 my.ini 里 log-bin 的开关状态）。"""
+        if probe.get('inspect') == 'mysql_log_bin':
+            server_dir = probe.get('server_dir', '')
+            if server_dir:
+                return CleanerLogic._mysql_log_bin_note(server_dir)
+        return probe.get('note', '')
+
+    @staticmethod
+    def _mysql_log_bin_note(server_dir):
+        """读取 my.ini 判断二进制日志是否仍处于开启状态。"""
+        ini = os.path.join(server_dir, 'my.ini')
+        try:
+            with open(ini, 'r', encoding='utf-8', errors='ignore') as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if not stripped or stripped[0] in '#;':
+                        continue
+                    if stripped.startswith('log-bin') or stripped.startswith('log_bin'):
+                        return '检测到 my.ini 中 log-bin 仍开启，这些日志会持续增长。'
+            return 'my.ini 中未发现开启的 log-bin，应该不会再增长。'
+        except OSError:
+            return ''
 
     def get_backup_info(self):
         """获取备份信息"""
@@ -793,6 +1432,13 @@ class CleanerLogic:
             # 工具 / 办公
             'tool_cache': [],    # 办公工具缓存
             'docker_data': [],   # Docker数据(仅分析)
+            'gpu_shader_cache': [],
+            'patch_cache': [],
+            'event_logs': [],
+            'wxwork_cache': [],
+            'electron_cache': [],
+            'service_worker_cache': [],
+            'dotnet_cache': [],
 
             # 大文件扫描
             'large_files': []    # 大文件
@@ -841,6 +1487,13 @@ class CleanerLogic:
             self._scan_gaming_cache,
             self._scan_tool_cache,
             self._scan_docker_data,
+            self._scan_gpu_shader_cache,
+            self._scan_patch_cache,
+            self._scan_event_logs,
+            self._scan_wxwork_cache,
+            self._scan_electron_cache,
+            self._scan_service_worker_cache,
+            self._scan_dotnet_cache,
             self._scan_large_files
         ]
 
@@ -887,6 +1540,13 @@ class CleanerLogic:
             self._scan_gaming_cache: "游戏娱乐缓存",
             self._scan_tool_cache: "办公工具缓存",
             self._scan_docker_data: "Docker数据",
+            self._scan_gpu_shader_cache: "GPU着色器缓存",
+            self._scan_patch_cache: "Windows补丁缓存",
+            self._scan_event_logs: "Windows事件日志",
+            self._scan_wxwork_cache: "企业微信缓存",
+            self._scan_electron_cache: "Electron应用缓存",
+            self._scan_service_worker_cache: "浏览器ServiceWorker缓存",
+            self._scan_dotnet_cache: ".NET缓存",
             self._scan_large_files: "大文件",
         }
 
@@ -932,6 +1592,13 @@ class CleanerLogic:
             self._scan_gaming_cache: 'gaming_cache',
             self._scan_tool_cache: 'tool_cache',
             self._scan_docker_data: 'docker_data',
+            self._scan_gpu_shader_cache: 'gpu_shader_cache',
+            self._scan_patch_cache: 'patch_cache',
+            self._scan_event_logs: 'event_logs',
+            self._scan_wxwork_cache: 'wxwork_cache',
+            self._scan_electron_cache: 'electron_cache',
+            self._scan_service_worker_cache: 'service_worker_cache',
+            self._scan_dotnet_cache: 'dotnet_cache',
             self._scan_large_files: 'large_files',
         }
         skip = set(skip_categories or [])
@@ -1167,30 +1834,52 @@ class CleanerLogic:
                 logger.warning(f"无法访问回收站: {e}")
 
     def _scan_browser_cache(self, results):
-        """扫描浏览器缓存"""
-        # Chrome缓存
-        chrome_cache = os.path.join(os.environ.get('LOCALAPPDATA', ''),
-                                   'Google', 'Chrome', 'User Data', 'Default', 'Cache')
+        """扫描浏览器缓存（Chrome/Edge 所有 Profile + Firefox 所有 Profile）"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        appdata = os.environ.get('APPDATA', '')
 
-        # Edge缓存
-        edge_cache = os.path.join(os.environ.get('LOCALAPPDATA', ''),
-                                 'Microsoft', 'Edge', 'User Data', 'Default', 'Cache')
+        cache_dirs = []
 
-        # Firefox缓存
-        firefox_profiles = os.path.join(os.environ.get('APPDATA', ''),
-                                      'Mozilla', 'Firefox', 'Profiles')
+        # Chrome — 扫描所有 Profile（Default, Profile 1, Profile 2, ...）
+        chrome_ud = os.path.join(local, 'Google', 'Chrome', 'User Data')
+        if os.path.isdir(chrome_ud):
+            try:
+                for entry in os.scandir(chrome_ud):
+                    if not entry.is_dir():
+                        continue
+                    if entry.name == 'Default' or entry.name.startswith('Profile'):
+                        for sub in ('Cache', 'Code Cache', 'GPUCache'):
+                            p = os.path.join(entry.path, sub)
+                            if os.path.isdir(p):
+                                cache_dirs.append(p)
+            except (PermissionError, OSError):
+                pass
 
-        cache_dirs = [chrome_cache, edge_cache]
+        # Edge — 扫描所有 Profile
+        edge_ud = os.path.join(local, 'Microsoft', 'Edge', 'User Data')
+        if os.path.isdir(edge_ud):
+            try:
+                for entry in os.scandir(edge_ud):
+                    if not entry.is_dir():
+                        continue
+                    if entry.name == 'Default' or entry.name.startswith('Profile'):
+                        for sub in ('Cache', 'Code Cache', 'GPUCache'):
+                            p = os.path.join(entry.path, sub)
+                            if os.path.isdir(p):
+                                cache_dirs.append(p)
+            except (PermissionError, OSError):
+                pass
 
-        # 添加Firefox配置文件缓存
-        if os.path.exists(firefox_profiles):
+        # Firefox — 所有 profile 的 cache2
+        firefox_profiles = os.path.join(appdata, 'Mozilla', 'Firefox', 'Profiles')
+        if os.path.isdir(firefox_profiles):
             try:
                 for profile in os.listdir(firefox_profiles):
                     profile_cache = os.path.join(firefox_profiles, profile, 'cache2')
-                    if os.path.exists(profile_cache):
+                    if os.path.isdir(profile_cache):
                         cache_dirs.append(profile_cache)
-            except (PermissionError, FileNotFoundError) as e:
-                logger.warning(f"无法访问Firefox配置文件: {e}")
+            except (PermissionError, FileNotFoundError):
+                pass
 
         # 扫描所有缓存目录
         for cache_dir in cache_dirs:
@@ -1899,37 +2588,104 @@ class CleanerLogic:
             os.path.join(appdata, 'Zoom', 'data', 'Cache'),
         ]
 
-        # 微信 - FileStorage/Cache under Documents/WeChat Files
+        # 微信 - 深度扫描：Cache + 日志 + 图片缓存 + 视频缓存
         wechat_base = os.path.join(home, 'Documents', 'WeChat Files')
         if os.path.isdir(wechat_base):
             for user_dir in os.listdir(wechat_base):
-                cache_path = os.path.join(wechat_base, user_dir, 'FileStorage', 'Cache')
-                if os.path.isdir(cache_path):
-                    dirs.append(cache_path)
+                user_path = os.path.join(wechat_base, user_dir)
+                if not os.path.isdir(user_path):
+                    continue
+                # FileStorage 各子目录
+                for sub in ('Cache', 'Video', 'Image', 'File'):
+                    p = os.path.join(user_path, 'FileStorage', sub)
+                    if os.path.isdir(p):
+                        dirs.append(p)
+                # 日志
+                log_path = os.path.join(user_path, 'Msg', 'FTSContact')
+                if os.path.isdir(log_path):
+                    dirs.append(log_path)
+                # 微信 Applet/miniprogramappbrand (小程序缓存)
+                applet_path = os.path.join(user_path, 'Applet')
+                if os.path.isdir(applet_path):
+                    dirs.append(applet_path)
 
-        # QQ
+        # 微信 LOCALAPPDATA 下的缓存
+        wechat_local = os.path.join(local, 'WeChat', 'All Users')
+        if os.path.isdir(wechat_local):
+            dirs.append(wechat_local)
+
+        # QQ/TIM — 深度扫描
         qq_base = os.path.join(home, 'Documents', 'Tencent Files')
         if os.path.isdir(qq_base):
             for user_dir in os.listdir(qq_base):
-                cache_path = os.path.join(qq_base, user_dir, 'FileRecv', '.cache')
-                if os.path.isdir(cache_path):
-                    dirs.append(cache_path)
+                user_path = os.path.join(qq_base, user_dir)
+                if not os.path.isdir(user_path):
+                    continue
+                # 文件接收缓存
+                for sub in ('FileRecv', 'Image', 'Video'):
+                    p = os.path.join(user_path, sub)
+                    if os.path.isdir(p):
+                        dirs.append(p)
+                # 日志
+                msg_path = os.path.join(user_path, 'Msg')
+                if os.path.isdir(msg_path):
+                    dirs.append(msg_path)
 
-        # 钉钉
+        # QQ NT (新版) LOCALAPPDATA 路径
+        qq_nt = os.path.join(local, 'Tencent', 'QQ')
+        if os.path.isdir(qq_nt):
+            try:
+                for entry in os.scandir(qq_nt):
+                    if entry.is_dir():
+                        for sub in ('Cache', 'Code Cache', 'GPUCache', 'logs'):
+                            p = os.path.join(entry.path, sub)
+                            if os.path.isdir(p):
+                                dirs.append(p)
+            except (PermissionError, OSError):
+                pass
+
+        # 钉钉 — Cache + 日志
         dingtalk_base = os.path.join(appdata, 'DingTalk')
         if os.path.isdir(dingtalk_base):
             for sub in os.listdir(dingtalk_base):
-                cache_path = os.path.join(dingtalk_base, sub, 'Cache')
-                if os.path.isdir(cache_path):
-                    dirs.append(cache_path)
+                sub_path = os.path.join(dingtalk_base, sub)
+                if not os.path.isdir(sub_path):
+                    continue
+                for cache_name in ('Cache', 'GPUCache', 'logs', 'Log'):
+                    cache_path = os.path.join(sub_path, cache_name)
+                    if os.path.isdir(cache_path):
+                        dirs.append(cache_path)
 
         # 飞书
         lark_base = os.path.join(appdata, 'Lark')
         if os.path.isdir(lark_base):
             for sub in os.listdir(lark_base):
-                cache_path = os.path.join(lark_base, sub, 'Cache')
-                if os.path.isdir(cache_path):
-                    dirs.append(cache_path)
+                sub_path = os.path.join(lark_base, sub)
+                if not os.path.isdir(sub_path):
+                    continue
+                for cache_name in ('Cache', 'GPUCache', 'Code Cache'):
+                    cache_path = os.path.join(sub_path, cache_name)
+                    if os.path.isdir(cache_path):
+                        dirs.append(cache_path)
+
+        # Foxmail 缓存
+        foxmail_paths = [
+            os.path.join(local, 'Foxmail', 'Cache'),
+            os.path.join(appdata, 'Foxmail7', 'Cache'),
+        ]
+        # Foxmail Storages 下各帐号的 Cache 目录
+        for fm_base in (os.path.join(local, 'Foxmail'),
+                        os.path.join(appdata, 'Foxmail7')):
+            if os.path.isdir(fm_base):
+                try:
+                    for entry in os.scandir(fm_base):
+                        if entry.is_dir():
+                            cache_p = os.path.join(entry.path, 'Cache')
+                            if os.path.isdir(cache_p):
+                                foxmail_paths.append(cache_p)
+                except (PermissionError, OSError):
+                    pass
+        dirs.extend(foxmail_paths)
 
         self._scan_directories(results, 'messaging_cache', dirs)
 
@@ -2014,7 +2770,180 @@ class CleanerLogic:
         ]
         self._scan_directories(results, 'docker_data', dirs)
 
-        """扫描下载文件夹 - 列出所有文件供用户逐个选择"""
+    def _scan_dotnet_cache(self, results):
+        """扫描 .NET Framework/Runtime 临时编译缓存和 NuGet 包缓存"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        home = os.path.expanduser('~')
+        dirs = []
+
+        # .NET Framework — Temporary ASP.NET Files (32-bit + 64-bit)
+        for fw_dir in ('Microsoft.NET\\Framework', 'Microsoft.NET\\Framework64'):
+            fw_path = os.path.join('C:', os.sep, 'Windows', fw_dir)
+            if os.path.isdir(fw_path):
+                try:
+                    for entry in os.scandir(fw_path):
+                        if entry.is_dir() and entry.name.startswith('v'):
+                            asp_temp = os.path.join(entry.path, 'Temporary ASP.NET Files')
+                            if os.path.isdir(asp_temp):
+                                dirs.append(asp_temp)
+                except (PermissionError, OSError):
+                    pass
+
+        # NGen 本机映像缓存（assembly\NativeImages_*）
+        for fw_dir in ('Microsoft.NET\\Framework', 'Microsoft.NET\\Framework64'):
+            assembly_path = os.path.join('C:', os.sep, 'Windows', 'assembly')
+            if os.path.isdir(assembly_path):
+                try:
+                    for entry in os.scandir(assembly_path):
+                        if entry.is_dir() and entry.name.startswith('NativeImages'):
+                            dirs.append(entry.path)
+                except (PermissionError, OSError):
+                    pass
+                break  # assembly 目录只需扫一次
+
+        # NuGet 全局包缓存
+        nuget_cache = os.path.join(home, '.nuget', 'packages')
+        if os.path.isdir(nuget_cache):
+            dirs.append(nuget_cache)
+
+        # NuGet HTTP 缓存
+        nuget_http = os.path.join(local, 'NuGet', 'v3-cache')
+        if os.path.isdir(nuget_http):
+            dirs.append(nuget_http)
+
+        # dotnet SDK workload/temp
+        dotnet_temp = os.path.join(local, 'Temp', '.dotnet')
+        if os.path.isdir(dotnet_temp):
+            dirs.append(dotnet_temp)
+
+        self._scan_directories(results, 'dotnet_cache', dirs)
+
+    def _scan_gpu_shader_cache(self, results):
+        """扫描 GPU 着色器缓存（NVIDIA/AMD/DirectX）"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        dirs = [
+            os.path.join(local, 'NVIDIA', 'DXCache'),
+            os.path.join(local, 'NVIDIA', 'GLCache'),
+            os.path.join(local, 'NVIDIA Corporation', 'NV_Cache'),
+            os.path.join(local, 'AMD', 'DxCache'),
+            os.path.join(local, 'AMD', 'GLCache'),
+            os.path.join(local, 'D3DSCache'),
+            os.path.join(local, 'Intel', 'ShaderCache'),
+        ]
+        self._scan_directories(results, 'gpu_shader_cache', dirs)
+
+    def _scan_patch_cache(self, results):
+        """扫描 Windows Installer 补丁缓存（$PatchCache$）"""
+        dirs = [
+            os.path.join('C:', os.sep, 'Windows', 'Installer', '$PatchCache$'),
+        ]
+        self._scan_directories(results, 'patch_cache', dirs)
+
+    def _scan_event_logs(self, results):
+        """扫描 Windows 事件日志（.evtx 文件，通常可安全清除旧日志）"""
+        log_dir = os.path.join('C:', os.sep, 'Windows', 'System32', 'winevt', 'Logs')
+        if not os.path.isdir(log_dir):
+            return
+        threshold = datetime.datetime.now() - datetime.timedelta(days=30)
+        try:
+            for entry in os.scandir(log_dir):
+                if not entry.name.lower().endswith('.evtx'):
+                    continue
+                try:
+                    stat = entry.stat()
+                    mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+                    if mtime < threshold and stat.st_size > 0:
+                        results['event_logs'].append({
+                            'path': entry.path,
+                            'size': stat.st_size,
+                            'type': 'event_logs',
+                        })
+                except (PermissionError, OSError):
+                    pass
+        except (PermissionError, OSError):
+            pass
+
+    def _scan_wxwork_cache(self, results):
+        """扫描企业微信缓存"""
+        appdata = os.environ.get('APPDATA', '')
+        local = os.environ.get('LOCALAPPDATA', '')
+        dirs = [
+            os.path.join(appdata, 'Tencent', 'WXWork', 'Cache'),
+            os.path.join(appdata, 'Tencent', 'WXWork', 'GPUCache'),
+        ]
+        # 企业微信在 LOCALAPPDATA 下可能有用户子目录
+        wxwork_local = os.path.join(local, 'Tencent', 'WXWork')
+        if os.path.isdir(wxwork_local):
+            try:
+                for entry in os.scandir(wxwork_local):
+                    if entry.is_dir():
+                        cache_sub = os.path.join(entry.path, 'Cache')
+                        if os.path.isdir(cache_sub):
+                            dirs.append(cache_sub)
+                        gpu_sub = os.path.join(entry.path, 'GPUCache')
+                        if os.path.isdir(gpu_sub):
+                            dirs.append(gpu_sub)
+            except (PermissionError, OSError):
+                pass
+        self._scan_directories(results, 'wxwork_cache', dirs)
+
+    def _scan_electron_cache(self, results):
+        """扫描各 Electron 应用的通用缓存目录"""
+        appdata = os.environ.get('APPDATA', '')
+        local = os.environ.get('LOCALAPPDATA', '')
+        dirs = []
+        # 常见 Electron 应用（排除已在其它分类中覆盖的）
+        known_covered = {'notion', 'obsidian', 'figma', 'postman',
+                         'wechat', 'qq', 'discord', 'slack', 'telegram desktop',
+                         'code', 'cursor'}
+        for base in (appdata, local):
+            if not base or not os.path.isdir(base):
+                continue
+            try:
+                for entry in os.scandir(base):
+                    if not entry.is_dir():
+                        continue
+                    if entry.name.lower() in known_covered:
+                        continue
+                    cache_path = os.path.join(entry.path, 'Cache')
+                    code_cache = os.path.join(entry.path, 'Code Cache')
+                    gpu_cache = os.path.join(entry.path, 'GPUCache')
+                    # 只有同时存在 Cache 和某种 Electron 特征文件才纳入
+                    if os.path.isdir(cache_path) and (
+                            os.path.isdir(code_cache) or os.path.isdir(gpu_cache)):
+                        dirs.append(cache_path)
+                        if os.path.isdir(code_cache):
+                            dirs.append(code_cache)
+                        if os.path.isdir(gpu_cache):
+                            dirs.append(gpu_cache)
+            except (PermissionError, OSError):
+                pass
+        self._scan_directories(results, 'electron_cache', dirs)
+
+    def _scan_service_worker_cache(self, results):
+        """扫描浏览器 Service Worker / CacheStorage 缓存"""
+        local = os.environ.get('LOCALAPPDATA', '')
+        dirs = []
+        browser_paths = [
+            os.path.join(local, 'Google', 'Chrome', 'User Data'),
+            os.path.join(local, 'Microsoft', 'Edge', 'User Data'),
+            os.path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data'),
+        ]
+        for browser in browser_paths:
+            if not os.path.isdir(browser):
+                continue
+            try:
+                for entry in os.scandir(browser):
+                    if not entry.is_dir():
+                        continue
+                    # Default, Profile 1, Profile 2, etc.
+                    if entry.name == 'Default' or entry.name.startswith('Profile'):
+                        sw = os.path.join(entry.path, 'Service Worker', 'CacheStorage')
+                        if os.path.isdir(sw):
+                            dirs.append(sw)
+            except (PermissionError, OSError):
+                pass
+        self._scan_directories(results, 'service_worker_cache', dirs)
         # 获取当前用户的下载文件夹
         download_dirs = [
             os.path.join('C:', os.sep, 'Users', os.environ.get('USERNAME', ''), 'Downloads'),
@@ -2431,53 +3360,10 @@ class CleanerLogic:
             if backup_session:
                 self._backup_file(file_path, backup_session)
 
-            # 其它磁盘清理必须永久删除，否则文件仍占用原磁盘空间。
-            if permanent:
-                os.remove(file_path)
-                logger.info(f"已永久删除文件: {file_path}")
-                return file_size
-
-            # 普通系统清理默认移动到回收站，保留 Windows 撤销能力。
-            try:
-                # 尝试使用 Windows API 移动到回收站。
-                import ctypes
-                from ctypes import windll
-                from ctypes.wintypes import HWND, UINT, LPCWSTR, BOOL
-
-                SHFileOperationW = windll.shell32.SHFileOperationW
-
-                class SHFILEOPSTRUCTW(ctypes.Structure):
-                    _fields_ = [
-                        ("hwnd", HWND),
-                        ("wFunc", UINT),
-                        ("pFrom", LPCWSTR),
-                        ("pTo", LPCWSTR),
-                        ("fFlags", UINT),
-                        ("fAnyOperationsAborted", BOOL),
-                        ("hNameMappings", ctypes.c_void_p),
-                        ("lpszProgressTitle", LPCWSTR)
-                    ]
-
-                FO_DELETE = 3
-                FOF_ALLOWUNDO = 0x40  # 允许撤销（移动到回收站）
-                FOF_NOCONFIRMATION = 0x10  # 不显示确认对话框
-                path = file_path + '\0\0'
-                fileop = SHFILEOPSTRUCTW(
-                    None, FO_DELETE, path, None,
-                    FOF_ALLOWUNDO | FOF_NOCONFIRMATION,
-                    None, None, None
-                )
-                result = SHFileOperationW(ctypes.byref(fileop))
-            except Exception:
-                # API 不可用时只回退一次；回退失败的原始异常交给上层分类。
-                os.remove(file_path)
-                logger.info(f"已直接删除文件: {file_path}")
-            else:
-                if result == 0:
-                    logger.info(f"已删除文件到回收站: {file_path}")
-                else:
-                    os.remove(file_path)
-                    logger.info(f"已直接删除文件: {file_path}")
+            # 已备份或其它磁盘清理：直接永久删除，立即释放空间。
+            # 旧逻辑移到回收站会导致磁盘空间不变。
+            os.remove(file_path)
+            logger.info(f"已永久删除文件: {file_path}")
 
             return file_size
         except FileNotFoundError:

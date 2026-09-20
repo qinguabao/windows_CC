@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-This is a Windows Python desktop cleaner using one PySide6 interface. `cleaner_logic.py` contains scanning, safety checks, manifest-backed backup, restore, and deletion behavior. `app_modern.py` is the primary interface; `main.py` is a compatibility launcher for the same PySide6 application. `backup_manager.py` contains the PySide6 backup management dialog, and `storage_cleaner.py` contains the other-drive large-file and duplicate-file workflow. Supporting modules include `elevate.py` and `config.py`. Icons live in `icons/`; PyInstaller specifications and build scripts are at the repository root. Generated `build/` and `dist/` artifacts should not be edited by hand.
+This is a Windows Python desktop cleaner using one PySide6 interface. `cleaner_logic.py` contains scanning, safety checks, manifest-backed backup, restore, and deletion behavior. `app_modern.py` is the primary interface; `main.py` is a compatibility launcher for the same PySide6 application. `backup_manager.py` contains the PySide6 backup management dialog, and `storage_cleaner.py` contains the other-drive large-file and duplicate-file workflow. `diagnostic.py` contains the read-only deep-diagnostics dialog that reports space the cleaner deliberately does not clean (database files/binlogs, app data, cloud-sync folders, IDE caches, system and image leftovers); it only displays and never deletes. Supporting modules include `elevate.py` and `settings.py`. Icons live in `icons/`; PyInstaller specifications and build scripts are at the repository root. Generated `build/` and `dist/` artifacts should not be edited by hand.
 
 ## Build, Test, and Development Commands
 
@@ -27,4 +27,4 @@ Git metadata is not present in this checkout, so no repository-specific history 
 
 ## Safety & Configuration
 
-Never broaden deletion paths without updating `_is_safe_path` and adding a regression check. Preserve simulation mode and backup defaults while changing cleanup behavior. Treat download folders and other user-owned paths as high risk: require an explicit confirmation warning before deletion.
+Never broaden deletion paths without updating `_is_safe_path` and adding a regression check. Preserve simulation mode and backup defaults while changing cleanup behavior. Treat download folders and other user-owned paths as high risk: require an explicit confirmation warning before deletion. The deep-diagnostics feature (`CleanerLogic.scan_diagnostics` / `diagnostic.py`) is strictly display-only: keep its items typed `diagnostic_only` (listed in `ANALYSIS_ONLY_CATEGORIES`) and never route them into `clean_selected` or add delete controls to that dialog.

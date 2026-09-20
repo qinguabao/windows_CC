@@ -13,7 +13,7 @@
   python release.py
 
   # 或指定新版本号（自动更新 version.py）
-  python release.py 1.2.0
+  python release.py 1.4.0
 
   release.py 自动完成：
   1. 读取/更新版本号
@@ -22,3 +22,10 @@
   4. gh release create 上传 EXE 到 GitHub Releases
 
   前置条件：已安装 gh CLI 并登录（gh auth login）。
+
+
+  *************
+  为方便，现在手工上传编译后的文件，
+  主要是获取文件的hash值：
+  Get-FileHash "D:\F\99-workplace\02-2026\One-click-cleaning\dist\C盘清理工具Pro.exe" -Algorithm SHA256
+
