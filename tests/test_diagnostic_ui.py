@@ -6,10 +6,11 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import unittest  # noqa: E402
-from unittest.mock import Mock  # noqa: E402
+from unittest.mock import Mock, patch  # noqa: E402
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+import diagnostic  # noqa: E402
 from cleaner_logic import DIAGNOSTIC_ITEM_TYPE  # noqa: E402
 from diagnostic import (  # noqa: E402
     DiagnosticDialog,
@@ -125,6 +126,111 @@ class DiagnosticDialogTests(unittest.TestCase):
     def test_close_without_scan_is_immediate(self):
         self.dialog.close()
         self.assertFalse(self.dialog.isVisible())
+
+    def test_last_column_stretches_to_avoid_horizontal_overflow(self):
+        self.assertTrue(self.dialog.tree.header().stretchLastSection())
+
+    def test_detail_pane_shows_full_suggestion_on_selection(self):
+        long_hint = ("关闭日志：在 my.ini 注释 log-bin 并重启 MySQL；"
+                     "或设置 binlog_expire_logs_seconds 控制保留天数；"
+                     "清理请用 PURGE BINARY LOGS，切勿手动删除 Data 目录下的文件。")
+        self.dialog._on_scan_finished([
+            _item('db', 'MySQL 二进制日志', 100, suggestion=long_hint, note='log-bin 仍开启'),
+        ])
+        child = self.dialog.tree.topLevelItem(0).child(0)
+        self.dialog.tree.setCurrentItem(child)
+        self.app.processEvents()
+        self.assertEqual(self.dialog.detail_suggestion.toPlainText(), long_hint)
+        self.assertIn('log-bin 仍开启', self.dialog.detail_meta.text())
+
+    def test_detail_pane_clears_for_group_rows(self):
+        self.dialog._on_scan_finished([_item('db', 'x', 100)])
+        self.dialog.tree.setCurrentItem(self.dialog.tree.topLevelItem(0))
+        self.app.processEvents()
+        self.assertEqual(self.dialog.detail_suggestion.toPlainText(), '')
+        self.assertIn('选择一项', self.dialog.detail_meta.text())
+
+    def test_detail_pane_is_empty_before_any_result(self):
+        self.assertEqual(self.dialog.detail_suggestion.toPlainText(), '')
+        self.dialog._update_detail(None)
+        self.assertIn('选择一项', self.dialog.detail_meta.text())
+
+    def test_repopulating_resets_the_detail_pane(self):
+        self.dialog._on_scan_finished([_item('db', 'x', 100, suggestion='旧建议')])
+        self.dialog.tree.setCurrentItem(self.dialog.tree.topLevelItem(0).child(0))
+        self.app.processEvents()
+        self.assertEqual(self.dialog.detail_suggestion.toPlainText(), '旧建议')
+        self.dialog._on_scan_finished([_item('ide', 'y', 50, suggestion='新建议')])
+        self.assertEqual(self.dialog.detail_suggestion.toPlainText(), '')
+
+    def test_detail_path_is_kept_out_of_the_wrapping_meta_label(self):
+        long_path = 'C:/' + 'very-long-folder-name/' * 20 + 'x.bin'
+        self.dialog._on_scan_finished([_item('db', 'x', 100, path=long_path)])
+        self.dialog.tree.setCurrentItem(self.dialog.tree.topLevelItem(0).child(0))
+        self.app.processEvents()
+        self.assertEqual(self.dialog.detail_path.text(), long_path)
+        self.assertTrue(self.dialog.detail_path.isReadOnly())
+        # 长路径不再进入会自动换行的 meta 标签，避免把详情区撑高挤占表格
+        self.assertNotIn(long_path, self.dialog.detail_meta.text())
+
+    def _single_row(self, **overrides):
+        self.dialog._on_scan_finished([_item('db', 'row', 100, **overrides)])
+        return self.dialog.tree.topLevelItem(0).child(0)
+
+    def _invoke_context_menu(self, target, choice):
+        """用假菜单触发右键流程，返回 (菜单项文本, 剪贴板内容)。"""
+        self.dialog.show()
+        self.app.processEvents()
+        created = []
+
+        class FakeAction:
+            def __init__(self, text):
+                self.text = text
+
+        def fake_add(text):
+            action = FakeAction(text)
+            created.append(action)
+            return action
+
+        pos = self.dialog.tree.visualItemRect(target).center()
+        with patch.object(diagnostic, 'QMenu') as menu_class:
+            menu = menu_class.return_value
+            menu.addAction.side_effect = fake_add
+            menu.exec.side_effect = (
+                lambda *args, **kwargs: next((a for a in created if choice in a.text), None))
+            self.dialog._show_context_menu(pos)
+        return [action.text for action in created], QApplication.clipboard().text()
+
+    def test_context_menu_offers_both_copy_actions(self):
+        target = self._single_row()
+        labels, _clip = self._invoke_context_menu(target, '路径')
+        self.assertEqual(labels, ['复制路径', '复制处理建议'])
+
+    def test_context_menu_copies_the_full_path(self):
+        target = self._single_row(path='C:/ProgramData/MySQL/MySQL Server 8.0/Data')
+        _labels, clip = self._invoke_context_menu(target, '路径')
+        self.assertEqual(clip, 'C:/ProgramData/MySQL/MySQL Server 8.0/Data')
+        self.assertIn('已复制路径', self.dialog.status_label.text())
+
+    def test_context_menu_copies_the_full_suggestion(self):
+        long_hint = '很长的处理建议。' * 40
+        target = self._single_row(suggestion=long_hint)
+        _labels, clip = self._invoke_context_menu(target, '建议')
+        self.assertEqual(clip, long_hint)
+        self.assertIn('已复制处理建议', self.dialog.status_label.text())
+
+    def test_context_menu_syncs_the_detail_pane_to_the_clicked_row(self):
+        self.dialog._on_scan_finished([
+            _item('db', 'first', 10, suggestion='第一'),
+            _item('db', 'second', 20, suggestion='第二'),
+        ])
+        group = self.dialog.tree.topLevelItem(0)
+        # 子项按大小降序排列，按名字定位而不是按下标
+        second = next(group.child(i) for i in range(group.childCount())
+                      if group.child(i).text(0).startswith('second'))
+        self._invoke_context_menu(second, '建议')
+        self.assertIs(self.dialog.tree.currentItem(), second)
+        self.assertEqual(self.dialog.detail_suggestion.toPlainText(), '第二')
 
     def test_size_text_states(self):
         self.assertEqual(_size_text({'exists': False}), '—')

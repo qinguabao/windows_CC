@@ -15,8 +15,10 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QTreeWidget,
@@ -111,8 +113,8 @@ class DiagnosticDialog(QDialog):
         self.items = []
         self._scan_thread = None
         self.setWindowTitle("深度诊断 — 清理工具覆盖不到的占用")
-        self.resize(1180, 720)
-        self.setMinimumSize(980, 600)
+        self.resize(1320, 800)
+        self.setMinimumSize(1000, 640)
         self._build_ui()
 
     # ────────────────────────── UI ──────────────────────────
@@ -158,15 +160,41 @@ class DiagnosticDialog(QDialog):
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["项目", "大小", "备注", "路径", "处理建议"])
-        self.tree.setColumnWidth(0, 250)
-        self.tree.setColumnWidth(1, 150)
-        self.tree.setColumnWidth(2, 220)
-        self.tree.setColumnWidth(3, 330)
-        self.tree.setColumnWidth(4, 430)
+        self.tree.setWordWrap(True)
+        self.tree.setUniformRowHeights(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
+        # 末列自适应剩余宽度，避免整表超宽而把「项目」列挤出视野
+        self.tree.header().setStretchLastSection(True)
+        self.tree.setColumnWidth(0, 230)
+        self.tree.setColumnWidth(1, 100)
+        self.tree.setColumnWidth(2, 190)
+        self.tree.setColumnWidth(3, 260)
+        self.tree.currentItemChanged.connect(self._update_detail)
         layout.addWidget(self.tree, 1)
+
+        detail_title = QLabel("选中项详情")
+        detail_font = detail_title.font()
+        detail_font.setBold(True)
+        detail_title.setFont(detail_font)
+        layout.addWidget(detail_title)
+
+        self.detail_meta = QLabel("在上方选择一项，这里完整显示它的备注与处理建议。")
+        self.detail_meta.setWordWrap(True)
+        self.detail_meta.setObjectName("status")
+        layout.addWidget(self.detail_meta)
+
+        # 路径单独用单行只读控件：长路径横向滚动，不会把详情区撑高挤占表格
+        self.detail_path = QLineEdit()
+        self.detail_path.setReadOnly(True)
+        self.detail_path.setPlaceholderText("路径")
+        layout.addWidget(self.detail_path)
+
+        self.detail_suggestion = QPlainTextEdit()
+        self.detail_suggestion.setReadOnly(True)
+        self.detail_suggestion.setMaximumHeight(84)
+        layout.addWidget(self.detail_suggestion)
 
         button_row = QHBoxLayout()
         button_row.addStretch()
@@ -264,9 +292,11 @@ class DiagnosticDialog(QDialog):
                 ])
                 child.setToolTip(3, entry.get('path', ''))
                 child.setToolTip(4, entry.get('suggestion', ''))
+                child.setData(0, Qt.UserRole, entry)
                 group_node.addChild(child)
             self.tree.addTopLevelItem(group_node)
         self.tree.expandAll()
+        self._update_detail(None)
 
         total_all = _deduped_total(visible)
         parts = [f"合计占用（已去重）：<b>{format_size(total_all)}</b>", f"共 {len(visible)} 项"]
@@ -289,19 +319,43 @@ class DiagnosticDialog(QDialog):
             text = f"{text}（{count} 个文件）"
         return text
 
+    def _update_detail(self, current, _previous=None):
+        """详情区完整显示选中项，避免列宽不足时丢失文字。"""
+        data = current.data(0, Qt.UserRole) if current is not None else None
+        if not isinstance(data, dict):
+            self.detail_meta.setText("在上方选择一项，这里完整显示它的备注与处理建议。")
+            self.detail_path.clear()
+            self.detail_suggestion.setPlainText("")
+            return
+        parts = [data.get('name', ''), _size_text(data)]
+        if data.get('file_count'):
+            parts.append(f"{data['file_count']} 个文件")
+        if data.get('note'):
+            parts.append(f"备注：{data['note']}")
+        self.detail_meta.setText("　·　".join(parts))
+        self.detail_path.setText(data.get('path', ''))
+        self.detail_path.setCursorPosition(0)
+        self.detail_suggestion.setPlainText(data.get('suggestion', '') or '（无处理建议）')
+
     def _show_context_menu(self, pos):
         node = self.tree.itemAt(pos)
         if node is None:
             return
-        path = node.text(3)
-        if not path:
+        data = node.data(0, Qt.UserRole)
+        if not isinstance(data, dict):
             return
+        # 右键同时选中该行，保证详情区与复制目标一致
+        self.tree.setCurrentItem(node)
         menu = QMenu(self)
-        copy_action = menu.addAction("复制路径")
+        copy_path_action = menu.addAction("复制路径")
+        copy_hint_action = menu.addAction("复制处理建议")
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
-        if chosen is copy_action:
-            QApplication.clipboard().setText(path)
+        if chosen is copy_path_action:
+            QApplication.clipboard().setText(data.get('path', ''))
             self.status_label.setText("已复制路径到剪贴板。")
+        elif chosen is copy_hint_action:
+            QApplication.clipboard().setText(data.get('suggestion', ''))
+            self.status_label.setText("已复制处理建议到剪贴板。")
 
     # ────────────────────── 关闭时的线程清理 ──────────────────────
 
